@@ -39,12 +39,15 @@ cfg_select! {
         mod xous;
         pub use xous::*;
     }
+    target_os = "aros" => {
+        mod aros;
+        pub use aros::*;
+    }
     any(
         target_os = "vexos",
         target_family = "wasm",
         target_os = "zkvm",
         target_os = "trusty",
-        target_os = "aros",
     ) => {
         mod generic;
         pub use generic::*;

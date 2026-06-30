@@ -11,6 +11,7 @@
     target_os = "uefi",
     target_os = "wasi",
     target_os = "xous",
+    target_os = "aros",
 ))]
 mod common;
 
@@ -54,6 +55,10 @@ cfg_select! {
     target_os = "zkvm" => {
         mod zkvm;
         pub use zkvm::*;
+    }
+    target_os = "aros" => {
+        mod aros;
+        pub use aros::*;
     }
     _ => {
         mod unsupported;

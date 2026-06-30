@@ -44,6 +44,10 @@ cfg_select! {
         mod xous;
         use xous as imp;
     }
+    target_os = "aros" => {
+        mod aros;
+        use aros as imp;
+    }
     _ => {
         mod unsupported;
         use unsupported as imp;
