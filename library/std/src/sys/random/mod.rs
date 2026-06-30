@@ -112,6 +112,10 @@ cfg_select! {
         mod unsupported;
         pub use unsupported::{fill_bytes, hashmap_random_keys};
     }
+    target_os = "aros" => {
+        mod aros;
+        pub use aros::fill_bytes;
+    }
     _ => {}
 }
 

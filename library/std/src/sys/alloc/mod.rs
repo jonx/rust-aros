@@ -77,6 +77,9 @@ cfg_select! {
     ) => {
         mod unix;
     }
+    target_os = "aros" => {
+        mod aros;
+    }
     target_os = "windows" => {
         mod windows;
     }
