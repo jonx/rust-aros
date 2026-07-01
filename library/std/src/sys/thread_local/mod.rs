@@ -30,6 +30,8 @@ cfg_select! {
         target_os = "zkvm",
         target_os = "trusty",
         target_os = "vexos",
+        // AROS: staged for pthread-key TLS (sys/thread_local/key/aros.rs) but kept
+        // single-threaded until the std::thread sync core lands. See STD-PORT.md.
         target_os = "aros",
     ) => {
         mod no_threads;
