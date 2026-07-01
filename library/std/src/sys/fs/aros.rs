@@ -13,7 +13,6 @@
 use crate::ffi::{CString, OsString};
 use crate::fmt;
 use crate::fs::TryLockError;
-use crate::hash::{Hash, Hasher};
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
 use crate::path::{Path, PathBuf};
 pub use crate::sys::fs::common::Dir;
@@ -45,6 +44,34 @@ mod c {
     pub const SEEK_SET: c_int = 0;
     pub const SEEK_CUR: c_int = 1;
     pub const SEEK_END: c_int = 2;
+
+    // file-type bits of st_mode (octal, standard values; AROS posixc <sys/stat.h>)
+    pub const S_IFMT: u32 = 0o170000;
+    pub const S_IFREG: u32 = 0o100000;
+    pub const S_IFDIR: u32 = 0o040000;
+    pub const S_IFLNK: u32 = 0o120000;
+
+    /// Mirror of `struct aros_fileattr` in `hosted/rust/aros_fs_glue.c`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Attr {
+        pub size: u64,
+        pub mode: u32,
+        pub nlink: u32,
+        pub ino: u64,
+        pub mtime_sec: i64,
+        pub mtime_nsec: i64,
+        pub atime_sec: i64,
+        pub atime_nsec: i64,
+        pub ctime_sec: i64,
+        pub ctime_nsec: i64,
+    }
+
+    unsafe extern "C" {
+        pub fn aros_stat(path: *const c_char, out: *mut Attr) -> c_int;
+        pub fn aros_lstat(path: *const c_char, out: *mut Attr) -> c_int;
+        pub fn aros_fstat(fd: c_int, out: *mut Attr) -> c_int;
+    }
 }
 
 fn cstr(p: &Path) -> io::Result<CString> {
@@ -56,9 +83,26 @@ pub struct File {
     fd: i32,
 }
 
-pub struct FileAttr(!);
+#[derive(Clone)]
+pub struct FileAttr {
+    size: u64,
+    mode: u32,
+    mtime: (i64, i64),
+    atime: (i64, i64),
+}
 pub struct ReadDir(!);
 pub struct DirEntry(!);
+
+impl FileAttr {
+    fn from_raw(a: &c::Attr) -> FileAttr {
+        FileAttr {
+            size: a.size,
+            mode: a.mode,
+            mtime: (a.mtime_sec, a.mtime_nsec),
+            atime: (a.atime_sec, a.atime_nsec),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
@@ -72,36 +116,33 @@ pub struct OpenOptions {
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct FileTimes {}
-pub struct FilePermissions(!);
-pub struct FileType(!);
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct FilePermissions {
+    mode: u32,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct FileType {
+    mode: u32,
+}
 #[derive(Debug)]
 pub struct DirBuilder {}
 
 impl FileAttr {
-    pub fn size(&self) -> u64 { self.0 }
-    pub fn perm(&self) -> FilePermissions { self.0 }
-    pub fn file_type(&self) -> FileType { self.0 }
-    pub fn modified(&self) -> io::Result<SystemTime> { self.0 }
-    pub fn accessed(&self) -> io::Result<SystemTime> { self.0 }
-    pub fn created(&self) -> io::Result<SystemTime> { self.0 }
-}
-impl Clone for FileAttr {
-    fn clone(&self) -> FileAttr { self.0 }
+    pub fn size(&self) -> u64 { self.size }
+    pub fn perm(&self) -> FilePermissions { FilePermissions { mode: self.mode } }
+    pub fn file_type(&self) -> FileType { FileType { mode: self.mode } }
+    pub fn modified(&self) -> io::Result<SystemTime> { SystemTime::new(self.mtime.0, self.mtime.1) }
+    pub fn accessed(&self) -> io::Result<SystemTime> { SystemTime::new(self.atime.0, self.atime.1) }
+    pub fn created(&self) -> io::Result<SystemTime> {
+        Err(io::const_error!(io::ErrorKind::Unsupported, "birth time is not available on AROS"))
+    }
 }
 
 impl FilePermissions {
-    pub fn readonly(&self) -> bool { self.0 }
-    pub fn set_readonly(&mut self, _readonly: bool) { self.0 }
-}
-impl Clone for FilePermissions {
-    fn clone(&self) -> FilePermissions { self.0 }
-}
-impl PartialEq for FilePermissions {
-    fn eq(&self, _other: &FilePermissions) -> bool { self.0 }
-}
-impl Eq for FilePermissions {}
-impl fmt::Debug for FilePermissions {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result { self.0 }
+    pub fn readonly(&self) -> bool { self.mode & 0o222 == 0 }
+    pub fn set_readonly(&mut self, readonly: bool) {
+        if readonly { self.mode &= !0o222; } else { self.mode |= 0o222; }
+    }
 }
 
 impl FileTimes {
@@ -110,23 +151,9 @@ impl FileTimes {
 }
 
 impl FileType {
-    pub fn is_dir(&self) -> bool { self.0 }
-    pub fn is_file(&self) -> bool { self.0 }
-    pub fn is_symlink(&self) -> bool { self.0 }
-}
-impl Clone for FileType {
-    fn clone(&self) -> FileType { self.0 }
-}
-impl Copy for FileType {}
-impl PartialEq for FileType {
-    fn eq(&self, _other: &FileType) -> bool { self.0 }
-}
-impl Eq for FileType {}
-impl Hash for FileType {
-    fn hash<H: Hasher>(&self, _h: &mut H) { self.0 }
-}
-impl fmt::Debug for FileType {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result { self.0 }
+    pub fn is_dir(&self) -> bool { self.mode & c::S_IFMT == c::S_IFDIR }
+    pub fn is_file(&self) -> bool { self.mode & c::S_IFMT == c::S_IFREG }
+    pub fn is_symlink(&self) -> bool { self.mode & c::S_IFMT == c::S_IFLNK }
 }
 
 impl fmt::Debug for ReadDir {
@@ -242,7 +269,14 @@ impl File {
     }
     pub fn size(&self) -> Option<io::Result<u64>> { None }
 
-    pub fn file_attr(&self) -> io::Result<FileAttr> { unsupported() }
+    pub fn file_attr(&self) -> io::Result<FileAttr> {
+        let mut a: c::Attr = unsafe { crate::mem::zeroed() };
+        if unsafe { c::aros_fstat(self.fd, &mut a) } == 0 {
+            Ok(FileAttr::from_raw(&a))
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
     pub fn fsync(&self) -> io::Result<()> { Ok(()) }
     pub fn datasync(&self) -> io::Result<()> { Ok(()) }
     pub fn lock(&self) -> io::Result<()> { Ok(()) }
@@ -289,7 +323,7 @@ pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
     if unsafe { c::rename(a.as_ptr(), b.as_ptr()) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
-pub fn set_perm(_p: &Path, perm: FilePermissions) -> io::Result<()> { match perm.0 {} }
+pub fn set_perm(_p: &Path, _perm: FilePermissions) -> io::Result<()> { unsupported() }
 pub fn set_times(_p: &Path, _times: FileTimes) -> io::Result<()> { unsupported() }
 pub fn set_times_nofollow(_p: &Path, _times: FileTimes) -> io::Result<()> { unsupported() }
 
@@ -299,11 +333,33 @@ pub fn rmdir(p: &Path) -> io::Result<()> {
 }
 
 pub fn remove_dir_all(_path: &Path) -> io::Result<()> { unsupported() }
-pub fn exists(_path: &Path) -> io::Result<bool> { unsupported() }
+pub fn exists(path: &Path) -> io::Result<bool> {
+    match stat(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
 pub fn readlink(_p: &Path) -> io::Result<PathBuf> { unsupported() }
 pub fn symlink(_original: &Path, _link: &Path) -> io::Result<()> { unsupported() }
 pub fn link(_src: &Path, _dst: &Path) -> io::Result<()> { unsupported() }
-pub fn stat(_p: &Path) -> io::Result<FileAttr> { unsupported() }
-pub fn lstat(_p: &Path) -> io::Result<FileAttr> { unsupported() }
+pub fn stat(p: &Path) -> io::Result<FileAttr> {
+    let path = cstr(p)?;
+    let mut a: c::Attr = unsafe { crate::mem::zeroed() };
+    if unsafe { c::aros_stat(path.as_ptr(), &mut a) } == 0 {
+        Ok(FileAttr::from_raw(&a))
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+pub fn lstat(p: &Path) -> io::Result<FileAttr> {
+    let path = cstr(p)?;
+    let mut a: c::Attr = unsafe { crate::mem::zeroed() };
+    if unsafe { c::aros_lstat(path.as_ptr(), &mut a) } == 0 {
+        Ok(FileAttr::from_raw(&a))
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
 pub fn canonicalize(_p: &Path) -> io::Result<PathBuf> { unsupported() }
 pub fn copy(_from: &Path, _to: &Path) -> io::Result<u64> { unsupported() }
