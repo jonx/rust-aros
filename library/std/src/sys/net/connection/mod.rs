@@ -29,6 +29,10 @@ cfg_select! {
         mod uefi;
         pub use uefi::*;
     }
+    target_os = "aros" => {
+        mod aros;
+        pub use aros::*;
+    }
     _ => {
         mod unsupported;
         pub use unsupported::*;
