@@ -15,6 +15,10 @@ cfg_select! {
         mod motor;
         use motor as imp;
     }
+    target_os = "aros" => {
+        mod aros;
+        use aros as imp;
+    }
     _ => {
         mod unsupported;
         use unsupported as imp;
