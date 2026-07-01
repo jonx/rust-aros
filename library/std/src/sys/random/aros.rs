@@ -4,8 +4,15 @@
 //! so this seeds a SplitMix64 from address-space layout (a stack address, which
 //! varies per run under ASLR) plus a per-call counter. That is enough for
 //! `HashMap` keys to differ between runs; it is **not** cryptographically secure.
-//! Replace with a real CSPRNG once `posixc` grows one (then this file is the only
-//! thing that changes).
+//!
+//! Upgrade path (hosted darwin-aarch64): call the host `arc4random_buf` through
+//! `hostlib.resource` — `OpenResource("hostlib.resource")` → `HostLib_Open(
+//! "libSystem.dylib")` → `HostLib_GetPointer("arc4random_buf")`, the same idiom
+//! `arch/all-unix/battclock` uses for host time. That needs a small AROS-side glue
+//! and a review of host-call thread-safety from arbitrary task context (this
+//! `fill_bytes` can run on any task, unlike battclock's init), so it is deliberately
+//! deferred rather than shipped unsafely. On a native (non-hosted) AROS, wire this to
+//! whatever entropy device the port grows. Either way, this file is the only change.
 use crate::sync::atomic::{AtomicU64, Ordering};
 
 pub fn fill_bytes(bytes: &mut [u8]) {
