@@ -57,6 +57,10 @@ cfg_select! {
         mod zkvm;
         pub use zkvm::*;
     }
+    target_os = "aros" => {
+        mod aros;
+        pub use aros::*;
+    }
     _ => {
         mod unsupported;
         pub use unsupported::*;
