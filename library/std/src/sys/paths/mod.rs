@@ -47,6 +47,15 @@ cfg_select! {
         mod windows;
         use windows as imp;
     }
+    target_os = "aros" => {
+        mod aros;
+        #[expect(dead_code)]
+        mod unsupported;
+        mod imp {
+            pub use super::aros::{getcwd, chdir, temp_dir};
+            pub use super::unsupported::{current_exe, SplitPaths, split_paths, JoinPathsError, join_paths, home_dir};
+        }
+    }
     _ => {
         mod unsupported;
         use unsupported as imp;
