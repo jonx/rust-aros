@@ -4,8 +4,12 @@
 //! the demonstrable slice. Based on `sys/fs/unsupported.rs`.
 //!
 //! `off_t` is 64-bit on aarch64 (`__WORDSIZE==64`), `mode_t` is 16-bit, and AROS
-//! `open` is variadic. O_* use the NetBSD values AROS's posixc follows; O_RDONLY=0
-//! is safe regardless, so reads are solid even if a create flag needs tweaking.
+//! `open` is variadic. The access-mode flags are AROS-specific and do **not** follow
+//! NetBSD: `O_RDONLY=0x1`, `O_WRONLY=0x2`, `O_RDWR=0x3` (`O_ACCMODE=0x3`), from
+//! `compiler/crt/posixc/include/fcntl.h`. `O_RDONLY` is **not** 0 here, so a
+//! read-only open must set bit 0 or AROS `open` rejects the (zero) access mode with
+//! EINVAL. The create/misc flags (`O_CREAT=0x40`, `O_TRUNC=0x200`, `O_APPEND=0x400`)
+//! do match.
 use crate::ffi::{CString, OsString};
 use crate::fmt;
 use crate::fs::TryLockError;
@@ -31,9 +35,9 @@ mod c {
         pub fn mkdir(path: *const c_char, mode: mode_t) -> c_int;
         pub fn rmdir(path: *const c_char) -> c_int;
     }
-    pub const O_RDONLY: c_int = 0;
-    pub const O_WRONLY: c_int = 1;
-    pub const O_RDWR: c_int = 2;
+    pub const O_RDONLY: c_int = 0x0001;
+    pub const O_WRONLY: c_int = 0x0002;
+    pub const O_RDWR: c_int = 0x0003;
     pub const O_CREAT: c_int = 0x0040;
     pub const O_EXCL: c_int = 0x0080;
     pub const O_TRUNC: c_int = 0x0200;
