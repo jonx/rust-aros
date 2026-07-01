@@ -20,7 +20,7 @@ use crate::sys::time::SystemTime;
 use crate::sys::unsupported;
 
 mod c {
-    use crate::ffi::{c_char, c_int};
+    use crate::ffi::{c_char, c_int, c_void};
     pub type mode_t = u16;
     pub type off_t = i64;
     unsafe extern "C" {
@@ -33,7 +33,15 @@ mod c {
         pub fn rename(old: *const c_char, new: *const c_char) -> c_int;
         pub fn mkdir(path: *const c_char, mode: mode_t) -> c_int;
         pub fn rmdir(path: *const c_char) -> c_int;
+        // directory listing (aros_fs_glue.c, over posixc opendir/readdir/closedir)
+        pub fn aros_opendir(path: *const c_char) -> *mut c_void;
+        pub fn aros_readdir(dir: *mut c_void, namebuf: *mut c_char, buflen: usize, type_out: *mut u32) -> c_int;
+        pub fn aros_closedir(dir: *mut c_void);
     }
+    // d_type values from AROS posixc <dirent.h>
+    pub const DT_DIR: u32 = 4;
+    pub const DT_REG: u32 = 8;
+    pub const DT_LNK: u32 = 10;
     pub const O_RDONLY: c_int = 0x0001;
     pub const O_WRONLY: c_int = 0x0002;
     pub const O_RDWR: c_int = 0x0003;
@@ -90,8 +98,19 @@ pub struct FileAttr {
     mtime: (i64, i64),
     atime: (i64, i64),
 }
-pub struct ReadDir(!);
-pub struct DirEntry(!);
+pub struct ReadDir {
+    dir: *mut crate::ffi::c_void,
+    root: PathBuf,
+}
+// The DIR* is owned solely by this ReadDir; safe to move/observe across threads.
+unsafe impl Send for ReadDir {}
+unsafe impl Sync for ReadDir {}
+
+pub struct DirEntry {
+    name: OsString,
+    dtype: u32,
+    root: PathBuf,
+}
 
 impl FileAttr {
     fn from_raw(a: &c::Attr) -> FileAttr {
@@ -157,17 +176,48 @@ impl FileType {
 }
 
 impl fmt::Debug for ReadDir {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result { self.0 }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadDir").field("root", &self.root).finish()
+    }
 }
 impl Iterator for ReadDir {
     type Item = io::Result<DirEntry>;
-    fn next(&mut self) -> Option<io::Result<DirEntry>> { self.0 }
+    fn next(&mut self) -> Option<io::Result<DirEntry>> {
+        let mut buf = [0u8; 1024];
+        let mut dtype: u32 = 0;
+        let r = unsafe {
+            c::aros_readdir(self.dir, buf.as_mut_ptr() as *mut crate::ffi::c_char, buf.len(), &mut dtype)
+        };
+        match r {
+            1 => {
+                let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                let name = unsafe { OsString::from_encoded_bytes_unchecked(buf[..len].to_vec()) };
+                Some(Ok(DirEntry { name, dtype, root: self.root.clone() }))
+            }
+            0 => None,
+            _ => Some(Err(io::Error::last_os_error())),
+        }
+    }
+}
+impl Drop for ReadDir {
+    fn drop(&mut self) {
+        unsafe { c::aros_closedir(self.dir) };
+    }
 }
 impl DirEntry {
-    pub fn path(&self) -> PathBuf { self.0 }
-    pub fn file_name(&self) -> OsString { self.0 }
-    pub fn metadata(&self) -> io::Result<FileAttr> { self.0 }
-    pub fn file_type(&self) -> io::Result<FileType> { self.0 }
+    pub fn path(&self) -> PathBuf { self.root.join(&self.name) }
+    pub fn file_name(&self) -> OsString { self.name.clone() }
+    pub fn metadata(&self) -> io::Result<FileAttr> { stat(&self.path()) }
+    pub fn file_type(&self) -> io::Result<FileType> {
+        let mode = match self.dtype {
+            c::DT_DIR => c::S_IFDIR,
+            c::DT_REG => c::S_IFREG,
+            c::DT_LNK => c::S_IFLNK,
+            // DT_UNKNOWN or anything else: fall back to a stat
+            _ => return self.metadata().map(|a| a.file_type()),
+        };
+        Ok(FileType { mode })
+    }
 }
 
 impl OpenOptions {
@@ -310,7 +360,15 @@ impl DirBuilder {
     }
 }
 
-pub fn readdir(_p: &Path) -> io::Result<ReadDir> { unsupported() }
+pub fn readdir(p: &Path) -> io::Result<ReadDir> {
+    let path = cstr(p)?;
+    let dir = unsafe { c::aros_opendir(path.as_ptr()) };
+    if dir.is_null() {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ReadDir { dir, root: p.to_path_buf() })
+    }
+}
 
 pub fn unlink(p: &Path) -> io::Result<()> {
     let c = cstr(p)?;
