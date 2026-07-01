@@ -38,6 +38,7 @@ cfg_select! {
     any(
         target_family = "unix",
         target_os = "teeos",
+        target_os = "aros",
     ) => {
         mod pthread;
         pub use pthread::Parker;

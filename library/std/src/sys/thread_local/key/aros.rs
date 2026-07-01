@@ -1,7 +1,3 @@
-//! STAGED — not yet wired into `sys/thread_local/mod.rs` (aros stays on `no_threads`
-//! TLS until the std::thread sync core lands). This backend is complete; see
-//! STD-PORT.md "Threads (staged)".
-//!
 //! TLS keys for AROS, backed by `pthread.library` (the `-lpthread` linklib).
 //!
 //! Same shape as the `unix` key backend, but AROS has no `libc` crate binding yet,

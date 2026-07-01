@@ -1,8 +1,3 @@
-//! STAGED — not yet wired into `sys/thread/mod.rs`. Spawn/join/TLS are complete and
-//! correct, but wiring `std::thread` also needs the multi-threaded sync core
-//! (Mutex/Condvar/RwLock/Parker — aros's pal has no `sync` submodule yet) and the
-//! OS-wide `-ffixed-x18` rebuild for solidity. See STD-PORT.md "Threads (staged)".
-//!
 //! Threads for AROS, over `pthread.library` (via the `aros_thr_*` C glue).
 //!
 //! `pthread_create` maps to an AROS process; the glue owns the opaque

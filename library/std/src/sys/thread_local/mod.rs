@@ -30,9 +30,6 @@ cfg_select! {
         target_os = "zkvm",
         target_os = "trusty",
         target_os = "vexos",
-        // AROS: staged for pthread-key TLS (sys/thread_local/key/aros.rs) but kept
-        // single-threaded until the std::thread sync core lands. See STD-PORT.md.
-        target_os = "aros",
     ) => {
         mod no_threads;
         pub use no_threads::{EagerStorage, LazyStorage, thread_local_inner};
@@ -180,6 +177,17 @@ pub(crate) mod key {
             pub(super) use racy::LazyKey;
             pub(super) use sgx::{Key, get, set};
             use sgx::{create, destroy};
+        }
+        target_os = "aros" => {
+            mod racy;
+            mod aros;
+            #[cfg(test)]
+            mod tests;
+            pub(super) use racy::LazyKey;
+            pub(super) use aros::{Key, set};
+            #[cfg(any(not(target_thread_local), test))]
+            pub(super) use aros::get;
+            use aros::{create, destroy};
         }
         target_os = "xous" => {
             mod racy;
