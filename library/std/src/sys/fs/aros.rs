@@ -82,9 +82,46 @@ mod c {
     }
 }
 
+/// Convert a path for the posixc syscall boundary, translating the
+/// unix-join artifacts Rust callers produce into AROS device syntax:
+///
+/// - `SYS:/C` (what `PathBuf::join("SYS:", "C")` yields) -> `SYS:C` —
+///   on AROS a slash right after the device colon means the device
+///   root's *parent*, which no unix-minded caller ever intends.
+/// - runs of `/` collapse to one — `//` means grandparent on AROS.
+/// - a trailing `/` is stripped (`SYS:C/` locks the *parent* of C) —
+///   except on a bare device root (`SYS:`) or the lone `/`.
+///
+/// Paths with no device colon pass through untouched.
 fn cstr(p: &Path) -> io::Result<CString> {
-    CString::new(p.as_os_str().as_encoded_bytes())
-        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+    let bytes = p.as_os_str().as_encoded_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut seen_colon = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b':' && !seen_colon {
+            seen_colon = true;
+            out.push(b);
+            // Skip the single slash a unix-style join puts after the
+            // device colon.
+            if i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                i += 1;
+            }
+        } else if b == b'/' {
+            out.push(b);
+            while i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                i += 1;
+            }
+        } else {
+            out.push(b);
+        }
+        i += 1;
+    }
+    if seen_colon && out.len() > 1 && out.ends_with(b"/") && !out.ends_with(b":/") {
+        out.pop();
+    }
+    CString::new(out).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
 }
 
 pub struct File {
@@ -238,27 +275,47 @@ impl OpenOptions {
     pub fn create(&mut self, create: bool) { self.create = create; }
     pub fn create_new(&mut self, create_new: bool) { self.create_new = create_new; }
 
-    fn flags(&self) -> i32 {
-        let mut f = if self.read && self.write {
-            c::O_RDWR
-        } else if self.write || self.append {
-            c::O_WRONLY
-        } else {
-            c::O_RDONLY
+    // Same access/creation-mode rules as std's unix pal: append implies write
+    // (read+append must be O_RDWR, not O_WRONLY), create/create_new/truncate
+    // require write or append, and truncate+append is invalid. EINVAL is 22 in
+    // AROS's NetBSD errno numbering (see ../io/error/aros.rs).
+    fn flags(&self) -> io::Result<i32> {
+        const EINVAL: i32 = 22;
+        let access = match (self.read, self.write, self.append) {
+            (true, false, false) => c::O_RDONLY,
+            (false, true, false) => c::O_WRONLY,
+            (true, true, false) => c::O_RDWR,
+            (false, _, true) => c::O_WRONLY | c::O_APPEND,
+            (true, _, true) => c::O_RDWR | c::O_APPEND,
+            (false, false, false) => return Err(io::Error::from_raw_os_error(EINVAL)),
         };
-        if self.append {
-            f |= c::O_APPEND;
-        }
-        if self.truncate {
-            f |= c::O_TRUNC;
-        }
-        if self.create {
-            f |= c::O_CREAT;
-        }
+        let creation = match (self.write, self.append) {
+            (true, false) => 0,
+            (false, false) => {
+                if self.truncate || self.create || self.create_new {
+                    return Err(io::Error::from_raw_os_error(EINVAL));
+                }
+                0
+            }
+            (_, true) => {
+                if self.truncate && !self.create_new {
+                    return Err(io::Error::from_raw_os_error(EINVAL));
+                }
+                0
+            }
+        };
+        let mut f = access | creation;
         if self.create_new {
             f |= c::O_CREAT | c::O_EXCL;
+        } else {
+            if self.create {
+                f |= c::O_CREAT;
+            }
+            if self.truncate {
+                f |= c::O_TRUNC;
+            }
         }
-        f
+        Ok(f)
     }
 }
 
@@ -267,7 +324,7 @@ impl File {
         let p = cstr(path)?;
         // AROS `open` is variadic and reads the `mode` va_arg unconditionally, so
         // always pass it (ignored unless O_CREAT).
-        let fd = unsafe { c::open(p.as_ptr(), opts.flags(), 0o666 as crate::ffi::c_int) };
+        let fd = unsafe { c::open(p.as_ptr(), opts.flags()?, 0o666 as crate::ffi::c_int) };
         if fd < 0 { Err(io::Error::last_os_error()) } else { Ok(File { fd }) }
     }
 
