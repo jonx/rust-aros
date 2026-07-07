@@ -13,11 +13,14 @@
 //! so IPv6 requests return `Unsupported` rather than silently talking to the wrong
 //! address family.
 //!
-//! Blocking is solid. Two knobs are wired but **not yet effective** because the
-//! AROS library keeps host sockets `O_NONBLOCK` and emulates blocking with a
-//! timer-poll park: `set_nonblocking(true)` (the library treats `FIONBIO` as a
-//! no-op) and read/write timeouts (we return `Unsupported` for a requested timeout
-//! rather than lie). Both are noted for upstream.
+//! Blocking is solid, and `try_clone`/`duplicate` work (BSD `Dup2Socket`). Two knobs
+//! are wired but **not yet effective** because the AROS library keeps host sockets
+//! `O_NONBLOCK` and emulates blocking with a timer-poll park: `set_nonblocking(true)`
+//! (the library treats `FIONBIO` as a no-op) and read/write timeouts (we return
+//! `Unsupported` for a requested timeout rather than lie). Making those effective needs
+//! a `WaitSelect`-gated recv/send in the glue whose `fd_set` ABI must match the
+//! host-passthrough library exactly; that is a disclosed tier-3 gap, not a pal bug.
+//! Both are noted for upstream (UPSTREAM-NOTES #37).
 
 #![allow(dead_code)]
 
@@ -64,6 +67,7 @@ unsafe extern "C" {
     fn aros_np_getsockopt(s: c_int, level: c_int, name: c_int, val: *mut c_void, len: *mut u32)
     -> c_int;
     fn aros_np_set_nonblock(s: c_int, nonblock: c_int) -> c_int;
+    fn aros_np_dup(s: c_int) -> c_int;
     fn aros_np_resolve4(name: *const c_char, out: *mut u32, max: c_int) -> c_int;
 }
 
@@ -206,6 +210,11 @@ impl Socket {
         if r < 0 { Err(last_error()) } else { Ok(()) }
     }
 
+    fn try_clone(&self) -> io::Result<Socket> {
+        let fd = unsafe { aros_np_dup(self.0) };
+        if fd < 0 { Err(last_error()) } else { Ok(Socket(fd)) }
+    }
+
     fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         let how = match how {
             Shutdown::Read => SHUT_RD,
@@ -326,7 +335,7 @@ impl TcpStream {
     }
 
     pub fn duplicate(&self) -> io::Result<TcpStream> {
-        Err(io::const_error!(ErrorKind::Unsupported, "socket duplicate is not supported on AROS"))
+        Ok(TcpStream(self.0.try_clone()?))
     }
 
     pub fn set_linger(&self, linger: Option<Duration>) -> io::Result<()> {
@@ -428,7 +437,7 @@ impl TcpListener {
     }
 
     pub fn duplicate(&self) -> io::Result<TcpListener> {
-        Err(io::const_error!(ErrorKind::Unsupported, "socket duplicate is not supported on AROS"))
+        Ok(TcpListener(self.0.try_clone()?))
     }
 
     pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
@@ -518,7 +527,7 @@ impl UdpSocket {
     }
 
     pub fn duplicate(&self) -> io::Result<UdpSocket> {
-        Err(io::const_error!(ErrorKind::Unsupported, "socket duplicate is not supported on AROS"))
+        Ok(UdpSocket(self.0.try_clone()?))
     }
 
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {

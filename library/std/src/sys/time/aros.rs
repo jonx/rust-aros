@@ -75,6 +75,12 @@ impl SystemTime {
     pub fn checked_sub_duration(&self, other: &Duration) -> Option<SystemTime> {
         Some(SystemTime(self.0.checked_sub(*other)?))
     }
+
+    /// Seconds + nanoseconds since the epoch, for the `fs` pal's `utimes` glue.
+    #[allow(dead_code)]
+    pub(crate) fn to_secs_nanos(&self) -> (i64, i64) {
+        (self.0.as_secs() as i64, self.0.subsec_nanos() as i64)
+    }
 }
 
 impl fmt::Debug for SystemTime {

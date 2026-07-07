@@ -1,7 +1,11 @@
 //! fs for AROS, over posixc `open`/`read`/`write`/`lseek`/`close` (+ `unlink`/
-//! `mkdir`/`rename`). `File` is real; metadata, directory listing, permissions,
-//! symlinks etc. are stubs for now (return `Unsupported`) -- read/write a file is
-//! the demonstrable slice. Based on `sys/fs/unsupported.rs`.
+//! `mkdir`/`rename`/`chmod`/`symlink`/`readlink`/`utimes`) plus the `aros_*` stat/
+//! dir glue. `File`, metadata, directory listing, permissions (`chmod`/`fchmod`),
+//! symlinks (`symlink`/`readlink`), and path `set_times` (`utimes`) are real. The
+//! fd-based `File::set_times` and the nofollow `set_times` variant stay `Unsupported`
+//! because posixc has no `futimes`/`lutimes`; `link`/`copy`/`canonicalize`/
+//! `remove_dir_all`/`truncate`/`duplicate` remain stubs. Based on
+//! `sys/fs/unsupported.rs`.
 //!
 //! `off_t` is 64-bit on aarch64 (`__WORDSIZE==64`), `mode_t` is 16-bit, and AROS
 //! `open` is variadic. The access-mode flags are AROS-specific and do **not** follow
@@ -79,6 +83,20 @@ mod c {
         pub fn aros_stat(path: *const c_char, out: *mut Attr) -> c_int;
         pub fn aros_lstat(path: *const c_char, out: *mut Attr) -> c_int;
         pub fn aros_fstat(fd: c_int, out: *mut Attr) -> c_int;
+        // permissions + symlinks come straight from posixc (weak wrappers in
+        // libposixc.a: chmod->SetProtection, symlink->MakeLink, readlink->ReadLink).
+        pub fn chmod(path: *const c_char, mode: mode_t) -> c_int;
+        pub fn fchmod(fd: c_int, mode: mode_t) -> c_int;
+        pub fn symlink(target: *const c_char, linkpath: *const c_char) -> c_int;
+        pub fn readlink(path: *const c_char, buf: *mut c_char, bufsiz: usize) -> isize;
+        // set_times: aros_fs_glue.c builds the timeval[2] (posixc has utimes only).
+        pub fn aros_utimes(
+            path: *const c_char,
+            atime_sec: i64,
+            atime_nsec: i64,
+            mtime_sec: i64,
+            mtime_nsec: i64,
+        ) -> c_int;
     }
 }
 
@@ -171,7 +189,10 @@ pub struct OpenOptions {
 }
 
 #[derive(Copy, Clone, Debug, Default)]
-pub struct FileTimes {}
+pub struct FileTimes {
+    accessed: Option<SystemTime>,
+    modified: Option<SystemTime>,
+}
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FilePermissions {
     mode: u32,
@@ -202,8 +223,8 @@ impl FilePermissions {
 }
 
 impl FileTimes {
-    pub fn set_accessed(&mut self, _t: SystemTime) {}
-    pub fn set_modified(&mut self, _t: SystemTime) {}
+    pub fn set_accessed(&mut self, t: SystemTime) { self.accessed = Some(t); }
+    pub fn set_modified(&mut self, t: SystemTime) { self.modified = Some(t); }
 }
 
 impl FileType {
@@ -393,8 +414,20 @@ impl File {
     pub fn unlock(&self) -> io::Result<()> { Ok(()) }
     pub fn truncate(&self, _size: u64) -> io::Result<()> { unsupported() }
     pub fn duplicate(&self) -> io::Result<File> { unsupported() }
-    pub fn set_permissions(&self, _perm: FilePermissions) -> io::Result<()> { unsupported() }
-    pub fn set_times(&self, _times: FileTimes) -> io::Result<()> { unsupported() }
+    pub fn set_permissions(&self, perm: FilePermissions) -> io::Result<()> {
+        if unsafe { c::fchmod(self.fd, (perm.mode & 0o7777) as c::mode_t) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    // posixc has no futimes(), so times cannot be set through an open fd.
+    pub fn set_times(&self, _times: FileTimes) -> io::Result<()> {
+        Err(io::const_error!(
+            io::ErrorKind::Unsupported,
+            "setting file times through an open handle is not available on AROS (no futimes)"
+        ))
+    }
 }
 
 impl Drop for File {
@@ -438,9 +471,51 @@ pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
     if unsafe { c::rename(a.as_ptr(), b.as_ptr()) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
-pub fn set_perm(_p: &Path, _perm: FilePermissions) -> io::Result<()> { unsupported() }
-pub fn set_times(_p: &Path, _times: FileTimes) -> io::Result<()> { unsupported() }
-pub fn set_times_nofollow(_p: &Path, _times: FileTimes) -> io::Result<()> { unsupported() }
+pub fn set_perm(p: &Path, perm: FilePermissions) -> io::Result<()> {
+    let path = cstr(p)?;
+    if unsafe { c::chmod(path.as_ptr(), (perm.mode & 0o7777) as c::mode_t) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// `filetime` for a `set_times` call. When a caller sets only one of atime/mtime,
+/// std still hands us both fields; a `None` field means "leave unchanged", which
+/// posixc `utimes` can't express (it rewrites both), so we fill the gap from the
+/// current on-disk value via `stat` — matching what the unix pal does with
+/// `UTIME_OMIT` when the platform lacks it.
+fn set_times_common(p: &Path, times: FileTimes) -> io::Result<()> {
+    let (at, mt) = match (times.accessed, times.modified) {
+        (Some(a), Some(m)) => (a, m),
+        _ => {
+            let cur = stat(p)?;
+            let a = times.accessed.map_or_else(|| cur.accessed(), Ok)?;
+            let m = times.modified.map_or_else(|| cur.modified(), Ok)?;
+            (a, m)
+        }
+    };
+    let (as_, an) = at.to_secs_nanos();
+    let (ms, mn) = mt.to_secs_nanos();
+    let path = cstr(p)?;
+    if unsafe { c::aros_utimes(path.as_ptr(), as_, an, ms, mn) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+pub fn set_times(p: &Path, times: FileTimes) -> io::Result<()> {
+    set_times_common(p, times)
+}
+
+// posixc has no lutimes(), so a symlink's own times can't be set without following.
+pub fn set_times_nofollow(_p: &Path, _times: FileTimes) -> io::Result<()> {
+    Err(io::const_error!(
+        io::ErrorKind::Unsupported,
+        "setting a symlink's own times is not available on AROS (no lutimes)"
+    ))
+}
 
 pub fn rmdir(p: &Path) -> io::Result<()> {
     let c = cstr(p)?;
@@ -455,8 +530,39 @@ pub fn exists(path: &Path) -> io::Result<bool> {
         Err(e) => Err(e),
     }
 }
-pub fn readlink(_p: &Path) -> io::Result<PathBuf> { unsupported() }
-pub fn symlink(_original: &Path, _link: &Path) -> io::Result<()> { unsupported() }
+pub fn readlink(p: &Path) -> io::Result<PathBuf> {
+    let path = cstr(p)?;
+    // readlink doesn't NUL-terminate and gives no size hint; grow until it fits.
+    let mut cap = 256usize;
+    loop {
+        let mut buf: Vec<u8> = vec![0; cap];
+        let n = unsafe {
+            c::readlink(path.as_ptr(), buf.as_mut_ptr() as *mut crate::ffi::c_char, buf.len())
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let n = n as usize;
+        if n < buf.len() {
+            buf.truncate(n);
+            let os = unsafe { OsString::from_encoded_bytes_unchecked(buf) };
+            return Ok(PathBuf::from(os));
+        }
+        cap *= 2; // filled the buffer: the target may be longer, retry bigger
+    }
+}
+
+pub fn symlink(original: &Path, link: &Path) -> io::Result<()> {
+    // posixc symlink(oldpath, newpath): oldpath is the link target, newpath the link.
+    let target = cstr(original)?;
+    let linkpath = cstr(link)?;
+    if unsafe { c::symlink(target.as_ptr(), linkpath.as_ptr()) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 pub fn link(_src: &Path, _dst: &Path) -> io::Result<()> { unsupported() }
 pub fn stat(p: &Path) -> io::Result<FileAttr> {
     let path = cstr(p)?;

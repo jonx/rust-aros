@@ -5,18 +5,31 @@
 //! synchronously and returns the command's exit code.
 //!
 //! Scope (honest caveats): `output()` captures stdout/stderr by redirecting the
-//! child to `T:` temp files and reading them back (uses the `fs` pal); `spawn()` runs
-//! synchronously with inherited stdio, so `status()` works but there are no live
+//! child to `MacRW:` temp files and reading them back (uses the `fs` pal); `spawn()`
+//! runs synchronously with inherited stdio, so `status()` works but there are no live
 //! pipes and no true background child (a `spawn()`d process has already finished when
-//! the handle returns). `cwd`, per-command `env`, `kill`, and piped/`Null`/file stdio
-//! on `spawn` are not wired yet. Enough for "run a `C:` command, capture its output,
-//! read its exit code".
+//! the handle returns).
+//!
+//! **`cwd` and per-command `env` ARE honoured** (via a tiny injected shell script):
+//! AROS has no fork/exec and a `System` child inherits neither the caller's current
+//! directory *variables* nor its local environment variables, so when a `Command`
+//! carries a cwd or env override we emit a one-off script that `CD`s and `Set`s in the
+//! child shell, then runs the command, and invoke it with `Execute`. Non-resident
+//! commands run inside that shell's process and share its local vars, so the env
+//! reaches the real child.
+//!
+//! Still unsupported (documented tier-3 gaps): live bidirectional pipes and an async
+//! background child with a readable `Child.stdout`/writable `Child.stdin` -- these need
+//! a pipe handler the hosted boot does not mount (no `PIPE:`) and a real spawn model
+//! AROS's line-oriented `SystemTagList` does not provide. `env_clear()` cannot be fully
+//! honoured (the local-var set can't be enumerated to blank it), and `kill` is a no-op
+//! (the command has already finished on the synchronous path).
 
 use super::env::{CommandEnv, CommandEnvs, CommandResolvedEnvs};
 pub use crate::ffi::OsString as EnvKey;
 use crate::ffi::{CString, OsStr, OsString, c_char, c_long};
 use crate::num::NonZero;
-use crate::path::Path;
+use crate::path::{Path, PathBuf};
 use crate::process::StdioPipes;
 use crate::sync::atomic::{AtomicU32, Ordering};
 use crate::sys::fs::File;
@@ -128,14 +141,60 @@ impl Command {
         line
     }
 
+    /// Resolve the command into the actual line to hand `SystemTagList`, applying
+    /// `cwd` and per-command `env`. With neither set, that's just the quoted command
+    /// line. With either set, AROS's no-fork `System` can't apply them (a child
+    /// inherits neither the caller's current dir vars nor its local variables), so we
+    /// write a one-off script that `CD`s / `Set`s in the child shell and then runs the
+    /// command, and return `Execute <script>` plus the temp script path to delete.
+    fn resolve_line(&self) -> io::Result<(String, Option<PathBuf>)> {
+        let has_env = self.env.iter().next().is_some();
+        if self.cwd.is_none() && !has_env {
+            return Ok((self.command_line(), None));
+        }
+        let mut script = String::new();
+        if let Some(dir) = &self.cwd {
+            script.push_str("CD ");
+            quote_into(dir, &mut script);
+            script.push('\n');
+        }
+        for (k, v) in self.env.iter() {
+            match v {
+                Some(val) => {
+                    script.push_str("Set ");
+                    quote_into(k, &mut script);
+                    script.push(' ');
+                    quote_into(val, &mut script);
+                }
+                None => {
+                    script.push_str("Unset ");
+                    quote_into(k, &mut script);
+                }
+            }
+            script.push('\n');
+        }
+        script.push_str(&self.command_line());
+        script.push('\n');
+
+        static SCRIPT_SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SCRIPT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = format!("MacRW:rustcmd-{n}.aros");
+        write_script(&path, script.as_bytes())?;
+        Ok((format!("Execute {path}"), Some(PathBuf::from(path))))
+    }
+
     pub fn spawn(
         &mut self,
         _default: Stdio,
         _needs_stdin: bool,
     ) -> io::Result<(Process, StdioPipes)> {
         // synchronous, inherited stdio -> the command has finished when we return
-        let line = cstr(&self.command_line())?;
-        let rc = unsafe { aros_system(line.as_ptr(), core::ptr::null(), core::ptr::null()) };
+        let (line, script) = self.resolve_line()?;
+        let line_c = cstr(&line)?;
+        let rc = unsafe { aros_system(line_c.as_ptr(), core::ptr::null(), core::ptr::null()) };
+        if let Some(p) = script {
+            let _ = crate::sys::fs::remove_file(&p);
+        }
         // SystemTagList's -1 means "the command line could not be run at all" (no
         // shell, unloadable binary): that is spawn FAILURE, not an exit status.
         if rc == -1 {
@@ -146,6 +205,23 @@ impl Command {
             StdioPipes { stdin: None, stdout: None, stderr: None },
         ))
     }
+}
+
+/// Write a generated shell script through the fs pal (best path for `MacRW:`).
+fn write_script(path: &str, data: &[u8]) -> io::Result<()> {
+    let mut opts = crate::sys::fs::OpenOptions::new();
+    opts.write(true);
+    opts.create(true);
+    opts.truncate(true);
+    let f = File::open(Path::new(path), &opts)?;
+    let mut off = 0;
+    while off < data.len() {
+        match f.write(&data[off..])? {
+            0 => return Err(io::const_error!(io::ErrorKind::WriteZero, "short script write")),
+            n => off += n,
+        }
+    }
+    Ok(())
 }
 
 /// Append `arg` to `out`, quoting for the AROS shell when needed. The shell's escape
@@ -187,16 +263,20 @@ pub fn output(cmd: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
     let out_path = format!("MacRW:rustproc-{n}.out");
     let err_path = format!("MacRW:rustproc-{n}.err");
 
-    let line = cstr(&cmd.command_line())?;
+    let (line, script) = cmd.resolve_line()?;
+    let line_c = cstr(&line)?;
     let out_c = cstr(&out_path)?;
     let err_c = cstr(&err_path)?;
 
-    let rc = unsafe { aros_system(line.as_ptr(), out_c.as_ptr(), err_c.as_ptr()) };
+    let rc = unsafe { aros_system(line_c.as_ptr(), out_c.as_ptr(), err_c.as_ptr()) };
 
     let stdout = slurp(&out_path);
     let stderr = slurp(&err_path);
     let _ = crate::sys::fs::remove_file(Path::new(&out_path));
     let _ = crate::sys::fs::remove_file(Path::new(&err_path));
+    if let Some(p) = script {
+        let _ = crate::sys::fs::remove_file(&p);
+    }
 
     // Same contract as spawn: SystemTagList's -1 is "could not run", an Err.
     if rc == -1 {
