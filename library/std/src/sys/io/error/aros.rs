@@ -46,7 +46,11 @@ pub fn decode_error_kind(code: i32) -> ErrorKind {
         4 => Interrupted,         // EINTR
         13 => PermissionDenied,   // EACCES
         17 => AlreadyExists,      // EEXIST
+        20 => NotADirectory,      // ENOTDIR
+        21 => IsADirectory,       // EISDIR
         22 => InvalidInput,       // EINVAL
+        28 => StorageFull,        // ENOSPC
+        30 => ReadOnlyFilesystem, // EROFS
         32 => BrokenPipe,         // EPIPE
         35 => WouldBlock,         // EAGAIN / EWOULDBLOCK
         48 => AddrInUse,          // EADDRINUSE

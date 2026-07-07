@@ -136,6 +136,11 @@ impl Command {
         // synchronous, inherited stdio -> the command has finished when we return
         let line = cstr(&self.command_line())?;
         let rc = unsafe { aros_system(line.as_ptr(), core::ptr::null(), core::ptr::null()) };
+        // SystemTagList's -1 means "the command line could not be run at all" (no
+        // shell, unloadable binary): that is spawn FAILURE, not an exit status.
+        if rc == -1 {
+            return Err(io::const_error!(io::ErrorKind::NotFound, "command could not be run"));
+        }
         Ok((
             Process { code: rc as i32 },
             StdioPipes { stdin: None, stdout: None, stderr: None },
@@ -193,6 +198,10 @@ pub fn output(cmd: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
     let _ = crate::sys::fs::remove_file(Path::new(&out_path));
     let _ = crate::sys::fs::remove_file(Path::new(&err_path));
 
+    // Same contract as spawn: SystemTagList's -1 is "could not run", an Err.
+    if rc == -1 {
+        return Err(io::const_error!(io::ErrorKind::NotFound, "command could not be run"));
+    }
     Ok((ExitStatus(rc as i32), stdout, stderr))
 }
 

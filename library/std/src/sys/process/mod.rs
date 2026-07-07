@@ -15,7 +15,8 @@ cfg_select! {
         mod motor;
         use motor as imp;
     }
-    target_os = "aros" => {
+    // m68k-AROS (run68k stub OS) has no shell to run lines: unsupported fallback.
+    all(target_os = "aros", not(target_arch = "m68k")) => {
         mod aros;
         use aros as imp;
     }

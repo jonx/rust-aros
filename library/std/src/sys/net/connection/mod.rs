@@ -29,7 +29,8 @@ cfg_select! {
         mod uefi;
         pub use uefi::*;
     }
-    target_os = "aros" => {
+    // m68k-AROS (run68k stub OS) has no bsdsocket.library: unsupported fallback.
+    all(target_os = "aros", not(target_arch = "m68k")) => {
         mod aros;
         pub use aros::*;
     }

@@ -38,7 +38,9 @@ cfg_select! {
     any(
         target_family = "unix",
         target_os = "teeos",
-        target_os = "aros",
+        // m68k-AROS is single-task (run68k): the unsupported Parker below (a park
+        // can only be reached under contention, impossible with one task).
+        all(target_os = "aros", not(target_arch = "m68k")),
     ) => {
         mod pthread;
         pub use pthread::Parker;

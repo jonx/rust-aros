@@ -30,6 +30,8 @@ cfg_select! {
         target_os = "zkvm",
         target_os = "trusty",
         target_os = "vexos",
+        // m68k-AROS is single-task (run68k stub OS): plain statics ARE thread-local.
+        all(target_os = "aros", target_arch = "m68k"),
     ) => {
         mod no_threads;
         pub use no_threads::{EagerStorage, LazyStorage, thread_local_inner};
@@ -178,7 +180,8 @@ pub(crate) mod key {
             pub(super) use sgx::{Key, get, set};
             use sgx::{create, destroy};
         }
-        target_os = "aros" => {
+        // (m68k-AROS uses the no_threads Storage above; no OS key backend needed.)
+        all(target_os = "aros", not(target_arch = "m68k")) => {
             mod racy;
             mod aros;
             #[cfg(test)]

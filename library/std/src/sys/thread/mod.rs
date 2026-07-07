@@ -115,7 +115,9 @@ cfg_select! {
         mod unsupported;
         pub use unsupported::{current_os_id, set_name};
     }
-    target_os = "aros" => {
+    // m68k-AROS runs single-task under the run68k stub OS (no pthread.library):
+    // it takes the `unsupported` fallback (spawn errors at runtime).
+    all(target_os = "aros", not(target_arch = "m68k")) => {
         mod aros;
         pub use aros::{Thread, available_parallelism, current_os_id, set_name, sleep, yield_now, DEFAULT_MIN_STACK_SIZE};
     }

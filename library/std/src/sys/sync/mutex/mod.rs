@@ -20,7 +20,8 @@ cfg_select! {
     any(
         target_family = "unix",
         target_os = "teeos",
-        target_os = "aros",
+        // m68k-AROS is single-task (run68k): no_threads fallback, no pthread.
+        all(target_os = "aros", not(target_arch = "m68k")),
     ) => {
         mod pthread;
         pub use pthread::Mutex;
