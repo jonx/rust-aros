@@ -1,10 +1,12 @@
 //! fs for AROS, over posixc `open`/`read`/`write`/`lseek`/`close` (+ `unlink`/
 //! `mkdir`/`rename`/`chmod`/`symlink`/`readlink`/`utimes`) plus the `aros_*` stat/
 //! dir glue. `File`, metadata, directory listing, permissions (`chmod`/`fchmod`),
-//! symlinks (`symlink`/`readlink`), and path `set_times` (`utimes`) are real. The
-//! fd-based `File::set_times` and the nofollow `set_times` variant stay `Unsupported`
-//! because posixc has no `futimes`/`lutimes`; `link`/`copy`/`canonicalize`/
-//! `remove_dir_all`/`truncate`/`duplicate` remain stubs. Based on
+//! symlinks (`symlink`/`readlink`), and path `set_times` (`utimes`) are real, as
+//! are `canonicalize` (posixc `realpath`), `File::truncate` (`ftruncate`),
+//! `File::duplicate` (`dup`), and `copy`/`remove_dir_all` (the portable
+//! `sys/fs/common.rs` impls). Still `Unsupported`: the fd-based `File::set_times`
+//! and the nofollow `set_times` variant (posixc has no `futimes`/`lutimes`) and
+//! `link` (posixc's `link()` is itself a stub that sets EPERM). Based on
 //! `sys/fs/unsupported.rs`.
 //!
 //! `off_t` is 64-bit on aarch64 (`__WORDSIZE==64`), `mode_t` is 16-bit, and AROS
@@ -34,6 +36,12 @@ mod c {
         pub fn lseek(fd: c_int, offset: off_t, whence: c_int) -> off_t;
         pub fn close(fd: c_int) -> c_int;
         pub fn unlink(path: *const c_char) -> c_int;
+        pub fn dup(fd: c_int) -> c_int;
+        pub fn ftruncate(fd: c_int, length: off_t) -> c_int;
+        // aros_fs_glue.c: Lock() + NameFromLock(). posixc realpath() is
+        // unusable here -- it open(".")s to save the cwd, and "." is an
+        // invalid component name to DOS, so it fails EINVAL on every input.
+        pub fn aros_realpath(path: *const c_char, buf: *mut c_char, buflen: usize) -> c_int;
         pub fn rename(old: *const c_char, new: *const c_char) -> c_int;
         pub fn mkdir(path: *const c_char, mode: mode_t) -> c_int;
         pub fn rmdir(path: *const c_char) -> c_int;
@@ -42,6 +50,8 @@ mod c {
         pub fn aros_readdir(dir: *mut c_void, namebuf: *mut c_char, buflen: usize, type_out: *mut u32) -> c_int;
         pub fn aros_closedir(dir: *mut c_void);
     }
+    // <aros/posixc/limits.h>: PATH_MAX = _XOPEN_PATH_MAX = 1024
+    pub const PATH_MAX: usize = 1024;
     // d_type values from AROS posixc <dirent.h>
     pub const DT_DIR: u32 = 4;
     pub const DT_REG: u32 = 8;
@@ -106,38 +116,52 @@ mod c {
 /// - `SYS:/C` (what `PathBuf::join("SYS:", "C")` yields) -> `SYS:C` —
 ///   on AROS a slash right after the device colon means the device
 ///   root's *parent*, which no unix-minded caller ever intends.
-/// - runs of `/` collapse to one — `//` means grandparent on AROS.
-/// - a trailing `/` is stripped (`SYS:C/` locks the *parent* of C) —
-///   except on a bare device root (`SYS:`) or the lone `/`.
+/// - empty components (from `//` runs and trailing `/`) and `.`
+///   components vanish — they are unix-join noise; on AROS `//` means
+///   grandparent and `SYS:C/` locks the *parent* of C.
+/// - `..` becomes an AROS parent step: an empty component, so
+///   `a/../b` -> `a//b` ("b in a's parent") and a leading `../x`
+///   -> `/x`. A path of only `..`s gets its final extra `/`
+///   (`..` -> `/`, `../..` -> `//`).
 ///
-/// Paths with no device colon pass through untouched.
+/// A unix-style leading `/` on a colon-less path is preserved
+/// unchanged (it already means "up" to AROS, matching what relative
+/// unix paths that escape their base intend).
 fn cstr(p: &Path) -> io::Result<CString> {
     let bytes = p.as_os_str().as_encoded_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut seen_colon = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b':' && !seen_colon {
-            seen_colon = true;
-            out.push(b);
-            // Skip the single slash a unix-style join puts after the
-            // device colon.
-            if i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                i += 1;
+    // Device prefix through the first ':' passes untouched; exactly one
+    // '/' straight after the colon is a join artifact and dropped.
+    let rest = match bytes.iter().position(|&b| b == b':') {
+        Some(i) => {
+            out.extend_from_slice(&bytes[..=i]);
+            let mut r = &bytes[i + 1..];
+            if r.first() == Some(&b'/') {
+                r = &r[1..];
             }
-        } else if b == b'/' {
-            out.push(b);
-            while i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                i += 1;
-            }
-        } else {
-            out.push(b);
+            r
         }
-        i += 1;
+        None => bytes,
+    };
+    let lead = out.is_empty() && rest.first() == Some(&b'/');
+    let comps: Vec<&[u8]> = rest
+        .split(|&b| b == b'/')
+        .filter(|c| !c.is_empty() && *c != b".")
+        .map(|c| if c == b".." { &b""[..] } else { c })
+        .collect();
+    if lead {
+        out.push(b'/');
     }
-    if seen_colon && out.len() > 1 && out.ends_with(b"/") && !out.ends_with(b":/") {
-        out.pop();
+    for (i, c) in comps.iter().enumerate() {
+        if i > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(c);
+    }
+    // k parent steps and nothing else: the join above emitted k-1
+    // slashes; a parent step IS a slash on AROS, so add the missing one.
+    if !comps.is_empty() && comps.iter().all(|c| c.is_empty()) {
+        out.push(b'/');
     }
     CString::new(out).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
 }
@@ -412,8 +436,17 @@ impl File {
     pub fn try_lock(&self) -> Result<(), TryLockError> { Ok(()) }
     pub fn try_lock_shared(&self) -> Result<(), TryLockError> { Ok(()) }
     pub fn unlock(&self) -> io::Result<()> { Ok(()) }
-    pub fn truncate(&self, _size: u64) -> io::Result<()> { unsupported() }
-    pub fn duplicate(&self) -> io::Result<File> { unsupported() }
+    pub fn truncate(&self, size: u64) -> io::Result<()> {
+        if unsafe { c::ftruncate(self.fd, size as c::off_t) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    pub fn duplicate(&self) -> io::Result<File> {
+        let fd = unsafe { c::dup(self.fd) };
+        if fd < 0 { Err(io::Error::last_os_error()) } else { Ok(File { fd }) }
+    }
     pub fn set_permissions(&self, perm: FilePermissions) -> io::Result<()> {
         if unsafe { c::fchmod(self.fd, (perm.mode & 0o7777) as c::mode_t) } == 0 {
             Ok(())
@@ -522,7 +555,8 @@ pub fn rmdir(p: &Path) -> io::Result<()> {
     if unsafe { c::rmdir(c.as_ptr()) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
-pub fn remove_dir_all(_path: &Path) -> io::Result<()> { unsupported() }
+// Portable recursive implementation over this backend's read_dir/remove.
+pub use crate::sys::fs::common::remove_dir_all;
 pub fn exists(path: &Path) -> io::Result<bool> {
     match stat(path) {
         Ok(_) => Ok(true),
@@ -582,5 +616,21 @@ pub fn lstat(p: &Path) -> io::Result<FileAttr> {
         Err(io::Error::last_os_error())
     }
 }
-pub fn canonicalize(_p: &Path) -> io::Result<PathBuf> { unsupported() }
-pub fn copy(_from: &Path, _to: &Path) -> io::Result<u64> { unsupported() }
+pub fn canonicalize(p: &Path) -> io::Result<PathBuf> {
+    // Lock() + NameFromLock() via the glue: the handler resolves assigns,
+    // `..` components, and symlinks, and returns the absolute
+    // volume-rooted name.
+    let path = cstr(p)?;
+    let mut buf = [0u8; c::PATH_MAX];
+    let r = unsafe {
+        c::aros_realpath(path.as_ptr(), buf.as_mut_ptr() as *mut crate::ffi::c_char, buf.len())
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let os = unsafe { OsString::from_encoded_bytes_unchecked(buf[..len].to_vec()) };
+    Ok(PathBuf::from(os))
+}
+// Portable open/read/write implementation over this backend's File.
+pub use crate::sys::fs::common::copy;
