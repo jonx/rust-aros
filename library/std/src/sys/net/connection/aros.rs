@@ -152,6 +152,13 @@ impl Socket {
         self.0
     }
 
+    // Surrender ownership of the fd without closing it (for IntoRawFd).
+    fn into_raw(self) -> c_int {
+        let fd = self.0;
+        core::mem::forget(self);
+        fd
+    }
+
     fn setsockopt<T>(&self, level: c_int, name: c_int, val: T) -> io::Result<()> {
         let r = unsafe {
             aros_np_setsockopt(
@@ -695,4 +702,43 @@ pub fn lookup_host(host: &str, port: u16) -> io::Result<LookupHost> {
             .collect();
         Ok(LookupHost { iter: addrs.into_iter() })
     })
+}
+
+// Raw-fd accessors used by the `std::os::fd` bridge for network types
+// (see `os/fd/net_aros.rs`). The AROS socket layer is fd-based, so these
+// simply expose / consume / wrap the underlying descriptor.
+impl TcpStream {
+    pub fn as_raw_fd(&self) -> c_int {
+        self.0.fd()
+    }
+    pub fn into_raw_fd(self) -> c_int {
+        self.0.into_raw()
+    }
+    pub unsafe fn from_raw_fd(fd: c_int) -> TcpStream {
+        TcpStream(Socket::from_raw(fd))
+    }
+}
+
+impl TcpListener {
+    pub fn as_raw_fd(&self) -> c_int {
+        self.0.fd()
+    }
+    pub fn into_raw_fd(self) -> c_int {
+        self.0.into_raw()
+    }
+    pub unsafe fn from_raw_fd(fd: c_int) -> TcpListener {
+        TcpListener(Socket::from_raw(fd))
+    }
+}
+
+impl UdpSocket {
+    pub fn as_raw_fd(&self) -> c_int {
+        self.0.fd()
+    }
+    pub fn into_raw_fd(self) -> c_int {
+        self.0.into_raw()
+    }
+    pub unsafe fn from_raw_fd(fd: c_int) -> UdpSocket {
+        UdpSocket(Socket::from_raw(fd))
+    }
 }

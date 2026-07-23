@@ -15,6 +15,11 @@ mod owned;
 // Implementations for `AsRawFd` etc. for network types.
 #[cfg(not(any(target_os = "trusty", target_os = "aros")))]
 mod net;
+// AROS has a bare-descriptor socket pal, so its network fd traits are
+// implemented separately over the pal's raw-fd accessors.
+#[cfg(target_os = "aros")]
+#[path = "net_aros.rs"]
+mod net;
 
 // Implementation of stdio file descriptor constants.
 mod stdio;
