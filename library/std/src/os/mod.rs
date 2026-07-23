@@ -73,6 +73,7 @@ cfg_select! {
     target_os = "trusty",
     target_os = "wasi",
     target_os = "motor",
+    target_os = "aros",
     doc
 ))]
 pub mod fd;
