@@ -17,7 +17,12 @@ use crate::thread::ThreadInit;
 use crate::time::Duration;
 use crate::{io, ptr};
 
-pub const DEFAULT_MIN_STACK_SIZE: usize = 256 * 1024;
+/// Matches the unix default. AROS has no guard page and no stack growth: a
+/// thread that runs past its stack writes straight into whatever the allocator
+/// put below it, so the failure surfaces later as heap corruption somewhere
+/// unrelated rather than as a stack overflow. Rust code sized for the unix
+/// default has to be given the unix default.
+pub const DEFAULT_MIN_STACK_SIZE: usize = 2 * 1024 * 1024;
 
 unsafe extern "C" {
     fn aros_thr_spawn(
