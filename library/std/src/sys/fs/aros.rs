@@ -479,7 +479,28 @@ impl DirBuilder {
     pub fn new() -> DirBuilder { DirBuilder {} }
     pub fn mkdir(&self, p: &Path) -> io::Result<()> {
         let c = cstr(p)?;
-        if unsafe { c::mkdir(c.as_ptr(), 0o777) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+        if unsafe { c::mkdir(c.as_ptr(), 0o777) } == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        // AROS reports a failed CreateDir through IoErr(), and that does not
+        // reliably reach errno: both "it already exists" and "the parent is
+        // missing" come back as -1 with errno still 0. `create_dir_all` steers
+        // entirely on the error kind (AlreadyExists to stop, NotFound to
+        // recurse into the parent), so recover the distinction here by asking
+        // the filesystem.
+        if err.raw_os_error().unwrap_or(0) == 0 {
+            if stat(p).map(|a| a.file_type().is_dir()).unwrap_or(false) {
+                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+            }
+            if let Some(parent) = p.parent()
+                && !parent.as_os_str().is_empty()
+                && stat(parent).is_err()
+            {
+                return Err(io::Error::from(io::ErrorKind::NotFound));
+            }
+        }
+        Err(err)
     }
 }
 
