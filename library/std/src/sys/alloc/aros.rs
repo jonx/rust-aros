@@ -49,7 +49,18 @@ unsafe impl GlobalAlloc for System {
 
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if layout.align() <= MIN_ALIGN && layout.align() <= new_size {
+        // Only a block that actually came from `malloc` may be handed to
+        // `realloc`. AROS's `aligned_alloc` (behind `posix_memalign`) returns a
+        // pointer *into* a larger malloc block, with the real pointer and a
+        // magic marker stored just before it; `free` knows to look for that,
+        // `realloc` does not, and reads the block header at the wrong offset.
+        //
+        // So the test has to mirror `alloc`'s exactly -- on the ORIGINAL layout,
+        // not on `new_size`. The unix version gates on `new_size`, which is fine
+        // where aligned allocations share malloc's representation, but here it
+        // sends every grown over-aligned block through the wrong path and
+        // corrupts the heap.
+        if layout.align() <= MIN_ALIGN && layout.align() <= layout.size() {
             unsafe { c::realloc(ptr, new_size) }
         } else {
             unsafe { realloc_fallback(self, ptr, layout, new_size) }
