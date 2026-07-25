@@ -55,11 +55,38 @@ unsafe extern "C" {
     fn aros_task_self() -> *mut crate::ffi::c_void;
     fn aros_proc_exited(handle: *mut crate::ffi::c_void, code: *mut i32) -> i32;
     fn aros_proc_free(handle: *mut crate::ffi::c_void);
+    /// Why the last spawn failed, plus the dos error that came with it.
+    fn aros_proc_last_fail(ioerr: *mut c_long, step: *mut c_long) -> c_long;
 
     // exec signal plumbing, for waiting on the child without polling
     fn aros_sig_alloc() -> i32;
     fn aros_sig_free(bit: i32);
     fn aros_sig_wait(mask: u32) -> u32;
+}
+
+/// Turn the glue's reason for a failed spawn into something a caller can read.
+fn spawn_error() -> io::Error {
+    let (mut ioerr, mut step): (c_long, c_long) = (0, 0);
+    let why = unsafe { aros_proc_last_fail(&mut ioerr, &mut step) };
+    let stream = match why {
+        2 => "stdin",
+        3 => "stdout",
+        _ => "stderr",
+    };
+    let end = if step == 1 { "writing" } else { "reading" };
+    match why {
+        1 => io::Error::new(io::ErrorKind::OutOfMemory, "no memory to track the child"),
+        2..=4 => io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            format!("cannot open the {end} end of the child's {stream} pipe (dos error {ioerr})"),
+        ),
+        5 => io::Error::new(io::ErrorKind::NotFound, "cannot open NIL:"),
+        6 => io::Error::new(
+            io::ErrorKind::Other,
+            format!("the shell could not be started (dos error {ioerr})"),
+        ),
+        _ => io::Error::new(io::ErrorKind::NotFound, "command could not be run"),
+    }
 }
 
 const APS_INHERIT: i32 = 0;
@@ -168,11 +195,21 @@ impl Command {
 
     /// Build the shell command line: the program name followed by args[1..], each
     /// quoted for the AROS shell (escape char `*`).
+    ///
+    /// An empty program name means no command at all, not a command whose name
+    /// is the empty string. AROS reads that as "start a shell and let it read
+    /// its input", which is the only way to ask for an interactive shell on a
+    /// given pair of streams -- what a terminal needs, and what quoting the
+    /// empty string into `""` would break.
     fn command_line(&self) -> String {
         let mut line = String::new();
-        quote_into(&self.program, &mut line);
+        if !self.program.is_empty() {
+            quote_into(&self.program, &mut line);
+        }
         for arg in &self.args[1..] {
-            line.push(' ');
+            if !line.is_empty() {
+                line.push(' ');
+            }
             quote_into(arg, &mut line);
         }
         line
@@ -256,7 +293,7 @@ impl Command {
             if let Some(p) = script {
                 let _ = crate::sys::fs::remove_file(&p);
             }
-            return Err(io::const_error!(io::ErrorKind::NotFound, "command could not be run"));
+            return Err(spawn_error());
         }
 
         let pipes = StdioPipes {
