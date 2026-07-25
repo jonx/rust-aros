@@ -45,11 +45,14 @@ unsafe extern "C" {
         in_mode: i32,
         out_mode: i32,
         err_mode: i32,
-        exit_sig: u32,
         p_in: *mut isize,
         p_out: *mut isize,
         p_err: *mut isize,
     ) -> *mut crate::ffi::c_void;
+    /// Register (or clear, with a null task) who to wake when the child exits.
+    /// Returns non-zero if it has already exited.
+    fn aros_proc_set_waiter(handle: *mut crate::ffi::c_void, task: *mut crate::ffi::c_void, sigmask: u32) -> i32;
+    fn aros_task_self() -> *mut crate::ffi::c_void;
     fn aros_proc_exited(handle: *mut crate::ffi::c_void, code: *mut i32) -> i32;
     fn aros_proc_free(handle: *mut crate::ffi::c_void);
 
@@ -233,17 +236,6 @@ impl Command {
         let out_mode = disposition(Some(self.stdout.as_ref().unwrap_or(&default)));
         let err_mode = disposition(Some(self.stderr.as_ref().unwrap_or(&default)));
 
-        // The child signals this bit when it exits, so `wait` blocks rather
-        // than polling. Freed when the Process is dropped.
-        let sig_bit = unsafe { aros_sig_alloc() };
-        if sig_bit < 0 {
-            return Err(io::const_error!(
-                io::ErrorKind::Uncategorized,
-                "no free signal for child exit"
-            ));
-        }
-        let sig_mask = 1u32 << sig_bit;
-
         let (mut h_in, mut h_out, mut h_err) = (0isize, 0isize, 0isize);
         let handle = unsafe {
             aros_proc_spawn(
@@ -251,7 +243,6 @@ impl Command {
                 in_mode,
                 out_mode,
                 err_mode,
-                sig_mask,
                 &mut h_in,
                 &mut h_out,
                 &mut h_err,
@@ -262,7 +253,6 @@ impl Command {
         // open by now, but on AROS a running Execute re-reads the file, so keep
         // it until the child is reaped instead of deleting it here.
         if handle.is_null() {
-            unsafe { aros_sig_free(sig_bit) };
             if let Some(p) = script {
                 let _ = crate::sys::fs::remove_file(&p);
             }
@@ -274,7 +264,7 @@ impl Command {
             stdout: (h_out != 0).then(|| ChildPipe::from_handle(h_out)),
             stderr: (h_err != 0).then(|| ChildPipe::from_handle(h_err)),
         };
-        Ok((Process { handle, sig_bit, sig_mask, status: None, script }, pipes))
+        Ok((Process { handle, status: None, script }, pipes))
     }
 }
 
@@ -443,8 +433,6 @@ impl From<u8> for ExitCode {
 
 pub struct Process {
     handle: *mut crate::ffi::c_void,
-    sig_bit: i32,
-    sig_mask: u32,
     status: Option<ExitStatus>,
     /// The generated cwd/env script, removed once the child is reaped.
     script: Option<PathBuf>,
@@ -482,14 +470,32 @@ impl Process {
         if let Some(st) = self.status {
             return Ok(st);
         }
-        loop {
-            let mut code = 0i32;
-            if unsafe { aros_proc_exited(self.handle, &mut code) } != 0 {
-                return Ok(self.reap(code));
-            }
-            // Block on the exit signal rather than spinning.
-            unsafe { aros_sig_wait(self.sig_mask) };
+        // The exit signal is allocated on, and delivered to, *this* task, and
+        // only while we are actually inside the wait: the child may outlive us,
+        // and signalling a task that has since exited faults.
+        let bit = unsafe { aros_sig_alloc() };
+        if bit < 0 {
+            return Err(io::const_error!(
+                io::ErrorKind::Uncategorized,
+                "no free signal to wait for a child"
+            ));
         }
+        let mask = 1u32 << bit;
+        let me = unsafe { aros_task_self() };
+        let mut code = 0i32;
+        loop {
+            let already = unsafe { aros_proc_set_waiter(self.handle, me, mask) };
+            if already != 0 || unsafe { aros_proc_exited(self.handle, &mut code) } != 0 {
+                break;
+            }
+            unsafe { aros_sig_wait(mask) };
+        }
+        unsafe {
+            aros_proc_set_waiter(self.handle, core::ptr::null_mut(), 0);
+            aros_sig_free(bit);
+            aros_proc_exited(self.handle, &mut code);
+        }
+        Ok(self.reap(code))
     }
 
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
@@ -515,14 +521,10 @@ impl Drop for Process {
                 // Still running: leak the handle rather than let a dying child
                 // write into freed memory. Bounded by the number of children
                 // dropped while running, which is rare.
-                unsafe { aros_sig_free(self.sig_bit) };
                 return;
             }
         }
-        unsafe {
-            aros_proc_free(self.handle);
-            aros_sig_free(self.sig_bit);
-        }
+        unsafe { aros_proc_free(self.handle) };
         if let Some(p) = self.script.take() {
             let _ = crate::sys::fs::remove_file(&p);
         }
