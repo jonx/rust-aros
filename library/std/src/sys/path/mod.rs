@@ -35,6 +35,10 @@ cfg_select! {
         mod uefi;
         pub use uefi::*;
     }
+    target_os = "aros" => {
+        mod aros;
+        pub use aros::*;
+    }
     target_os = "cygwin" => {
         mod cygwin;
         mod windows_prefix;
