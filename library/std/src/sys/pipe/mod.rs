@@ -9,6 +9,10 @@ cfg_select! {
         mod windows;
         pub use windows::{Pipe, pipe};
     }
+    target_os = "aros" => {
+        mod aros;
+        pub use aros::{Pipe, pipe};
+    }
     target_os = "motor" => {
         mod motor;
         pub use motor::{Pipe, pipe};

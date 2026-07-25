@@ -38,6 +38,40 @@ use crate::{fmt, io};
 
 unsafe extern "C" {
     fn aros_system(cmdline: *const c_char, out_path: *const c_char, err_path: *const c_char) -> c_long;
+
+    // Streaming spawn (aros_proc_glue.c). Dispositions are APS_* below.
+    fn aros_proc_spawn(
+        cmdline: *const c_char,
+        in_mode: i32,
+        out_mode: i32,
+        err_mode: i32,
+        exit_sig: u32,
+        p_in: *mut isize,
+        p_out: *mut isize,
+        p_err: *mut isize,
+    ) -> *mut crate::ffi::c_void;
+    fn aros_proc_exited(handle: *mut crate::ffi::c_void, code: *mut i32) -> i32;
+    fn aros_proc_free(handle: *mut crate::ffi::c_void);
+
+    // exec signal plumbing, for waiting on the child without polling
+    fn aros_sig_alloc() -> i32;
+    fn aros_sig_free(bit: i32);
+    fn aros_sig_wait(mask: u32) -> u32;
+}
+
+const APS_INHERIT: i32 = 0;
+const APS_PIPE: i32 = 1;
+const APS_NULL: i32 = 2;
+
+fn disposition(s: Option<&Stdio>) -> i32 {
+    match s {
+        Some(Stdio::MakePipe) => APS_PIPE,
+        Some(Stdio::Null) => APS_NULL,
+        // A file or a parent stream is inherited: the child writes straight to
+        // it, which is what the caller asked for even though we cannot rebind
+        // an arbitrary File onto the child here.
+        _ => APS_INHERIT,
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -185,25 +219,62 @@ impl Command {
 
     pub fn spawn(
         &mut self,
-        _default: Stdio,
-        _needs_stdin: bool,
+        default: Stdio,
+        needs_stdin: bool,
     ) -> io::Result<(Process, StdioPipes)> {
-        // synchronous, inherited stdio -> the command has finished when we return
         let (line, script) = self.resolve_line()?;
         let line_c = cstr(&line)?;
-        let rc = unsafe { aros_system(line_c.as_ptr(), core::ptr::null(), core::ptr::null()) };
-        if let Some(p) = script {
-            let _ = crate::sys::fs::remove_file(&p);
+
+        // When the caller does not need to write to the child (`output()`,
+        // `status()`), an unset stdin is NULL rather than inherited: leaving it
+        // on the console makes a child that reads stdin block forever.
+        let default_stdin = if needs_stdin { &default } else { &Stdio::Null };
+        let in_mode = disposition(Some(self.stdin.as_ref().unwrap_or(default_stdin)));
+        let out_mode = disposition(Some(self.stdout.as_ref().unwrap_or(&default)));
+        let err_mode = disposition(Some(self.stderr.as_ref().unwrap_or(&default)));
+
+        // The child signals this bit when it exits, so `wait` blocks rather
+        // than polling. Freed when the Process is dropped.
+        let sig_bit = unsafe { aros_sig_alloc() };
+        if sig_bit < 0 {
+            return Err(io::const_error!(
+                io::ErrorKind::Uncategorized,
+                "no free signal for child exit"
+            ));
         }
-        // SystemTagList's -1 means "the command line could not be run at all" (no
-        // shell, unloadable binary): that is spawn FAILURE, not an exit status.
-        if rc == -1 {
+        let sig_mask = 1u32 << sig_bit;
+
+        let (mut h_in, mut h_out, mut h_err) = (0isize, 0isize, 0isize);
+        let handle = unsafe {
+            aros_proc_spawn(
+                line_c.as_ptr(),
+                in_mode,
+                out_mode,
+                err_mode,
+                sig_mask,
+                &mut h_in,
+                &mut h_out,
+                &mut h_err,
+            )
+        };
+
+        // The script is only needed while the shell reads it; the child has it
+        // open by now, but on AROS a running Execute re-reads the file, so keep
+        // it until the child is reaped instead of deleting it here.
+        if handle.is_null() {
+            unsafe { aros_sig_free(sig_bit) };
+            if let Some(p) = script {
+                let _ = crate::sys::fs::remove_file(&p);
+            }
             return Err(io::const_error!(io::ErrorKind::NotFound, "command could not be run"));
         }
-        Ok((
-            Process { code: rc as i32 },
-            StdioPipes { stdin: None, stdout: None, stderr: None },
-        ))
+
+        let pipes = StdioPipes {
+            stdin: (h_in != 0).then(|| ChildPipe::from_handle(h_in)),
+            stdout: (h_out != 0).then(|| ChildPipe::from_handle(h_out)),
+            stderr: (h_err != 0).then(|| ChildPipe::from_handle(h_err)),
+        };
+        Ok((Process { handle, sig_bit, sig_mask, status: None, script }, pipes))
     }
 }
 
@@ -254,35 +325,26 @@ fn cstr(s: &str) -> io::Result<CString> {
 /// Run `cmd`, capturing stdout+stderr via `T:` temp files (read back through the fs
 /// pal). This is `Command::output()`.
 pub fn output(cmd: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
-    // Capture via temp files. `T:` isn't guaranteed assigned on a minimal boot (it
-    // pops a blocking volume requester), so use the host-backed `MacRW:` share, which
-    // exists whenever the emul-handler is up. The glue also suppresses requesters, so
-    // a missing volume fails fast instead of hanging.
-    static SEQ: AtomicU32 = AtomicU32::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let out_path = format!("MacRW:rustproc-{n}.out");
-    let err_path = format!("MacRW:rustproc-{n}.err");
-
-    let (line, script) = cmd.resolve_line()?;
-    let line_c = cstr(&line)?;
-    let out_c = cstr(&out_path)?;
-    let err_c = cstr(&err_path)?;
-
-    let rc = unsafe { aros_system(line_c.as_ptr(), out_c.as_ptr(), err_c.as_ptr()) };
-
-    let stdout = slurp(&out_path);
-    let stderr = slurp(&err_path);
-    let _ = crate::sys::fs::remove_file(Path::new(&out_path));
-    let _ = crate::sys::fs::remove_file(Path::new(&err_path));
-    if let Some(p) = script {
-        let _ = crate::sys::fs::remove_file(&p);
+    // Runs on the same streaming path as `spawn`, so a child that outlives its
+    // output buffer (or writes more than a pipe holds) still completes, and the
+    // temp-file dance is gone. `needs_stdin = false` gives the child NIL: on
+    // stdin: inheriting the console here made any child that reads stdin block
+    // forever waiting for a terminal nobody was typing at.
+    let (mut proc, pipes) = cmd.spawn(Stdio::MakePipe, false)?;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    match (pipes.stdout, pipes.stderr) {
+        (Some(out), Some(err)) => read_output(out, &mut stdout, err, &mut stderr)?,
+        (Some(out), None) => {
+            out.read_to_end(&mut stdout)?;
+        }
+        (None, Some(err)) => {
+            err.read_to_end(&mut stderr)?;
+        }
+        (None, None) => {}
     }
-
-    // Same contract as spawn: SystemTagList's -1 is "could not run", an Err.
-    if rc == -1 {
-        return Err(io::const_error!(io::ErrorKind::NotFound, "command could not be run"));
-    }
-    Ok((ExitStatus(rc as i32), stdout, stderr))
+    let status = proc.wait()?;
+    Ok((status, stdout, stderr))
 }
 
 /// Read a whole file into a Vec via the fs pal (best-effort; empty on failure).
@@ -380,26 +442,90 @@ impl From<u8> for ExitCode {
 ////////////////////////////////////////////////////////////////////////////////
 
 pub struct Process {
-    code: i32,
+    handle: *mut crate::ffi::c_void,
+    sig_bit: i32,
+    sig_mask: u32,
+    status: Option<ExitStatus>,
+    /// The generated cwd/env script, removed once the child is reaped.
+    script: Option<PathBuf>,
 }
+
+// The handle is a plain allocation the glue owns; nothing in it is thread-affine.
+unsafe impl Send for Process {}
+unsafe impl Sync for Process {}
 
 impl Process {
     pub fn id(&self) -> u32 {
-        // No pid model on the synchronous shell path.
+        // AROS identifies a child by its Process pointer, not a small integer,
+        // and the shell child is not the command's own process anyway.
         0
     }
 
     pub fn kill(&mut self) -> io::Result<()> {
-        // The command already finished (synchronous spawn).
-        Ok(())
+        // Signalling an arbitrary AROS process to die is not generally safe:
+        // there is no equivalent of SIGKILL that unwinds a Process's resources.
+        // Closing the child's stdin (drop its ChildStdin) is the supported way
+        // to ask a well-behaved child to stop.
+        Err(io::const_error!(io::ErrorKind::Unsupported, "killing a child is not supported on AROS"))
+    }
+
+    fn reap(&mut self, code: i32) -> ExitStatus {
+        let st = ExitStatus(code);
+        self.status = Some(st);
+        if let Some(p) = self.script.take() {
+            let _ = crate::sys::fs::remove_file(&p);
+        }
+        st
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        Ok(ExitStatus(self.code))
+        if let Some(st) = self.status {
+            return Ok(st);
+        }
+        loop {
+            let mut code = 0i32;
+            if unsafe { aros_proc_exited(self.handle, &mut code) } != 0 {
+                return Ok(self.reap(code));
+            }
+            // Block on the exit signal rather than spinning.
+            unsafe { aros_sig_wait(self.sig_mask) };
+        }
     }
 
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        Ok(Some(ExitStatus(self.code)))
+        if let Some(st) = self.status {
+            return Ok(Some(st));
+        }
+        let mut code = 0i32;
+        if unsafe { aros_proc_exited(self.handle, &mut code) } != 0 {
+            Ok(Some(self.reap(code)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        // The exit hook writes through `handle`, so it may only be released
+        // once the child is known to be gone.
+        if self.status.is_none() {
+            let mut code = 0i32;
+            if unsafe { aros_proc_exited(self.handle, &mut code) } == 0 {
+                // Still running: leak the handle rather than let a dying child
+                // write into freed memory. Bounded by the number of children
+                // dropped while running, which is rare.
+                unsafe { aros_sig_free(self.sig_bit) };
+                return;
+            }
+        }
+        unsafe {
+            aros_proc_free(self.handle);
+            aros_sig_free(self.sig_bit);
+        }
+        if let Some(p) = self.script.take() {
+            let _ = crate::sys::fs::remove_file(&p);
+        }
     }
 }
 
@@ -426,8 +552,10 @@ impl From<io::Stderr> for Stdio {
 }
 
 impl From<ChildPipe> for Stdio {
-    fn from(pipe: ChildPipe) -> Stdio {
-        pipe.diverge()
+    fn from(_pipe: ChildPipe) -> Stdio {
+        // Handing one child's endpoint to another child would need the pipe
+        // rebound at spawn time, which the shell path cannot express.
+        Stdio::Null
     }
 }
 
@@ -462,14 +590,49 @@ impl<'a> fmt::Debug for CommandArgs<'a> {
 
 pub type ChildPipe = crate::sys::pipe::Pipe;
 
+/// Drain a child's stdout and stderr to EOF.
+///
+/// Sequential rather than concurrent: AROS pipes buffer, and the two streams
+/// belong to one child, so a child that fills stderr while we are still reading
+/// stdout could stall. Both endpoints are put in non-blocking mode and drained
+/// in turn so neither can wedge the other.
 pub fn read_output(
     out: ChildPipe,
-    _stdout: &mut Vec<u8>,
-    _err: ChildPipe,
-    _stderr: &mut Vec<u8>,
+    stdout: &mut Vec<u8>,
+    err: ChildPipe,
+    stderr: &mut Vec<u8>,
 ) -> io::Result<()> {
-    // We never hand back live pipes, so this is unreachable.
-    match out.diverge() {}
+    let _ = out.set_nonblocking(true);
+    let _ = err.set_nonblocking(true);
+
+    let (mut out_done, mut err_done) = (false, false);
+    let mut chunk = [0u8; 4096];
+    while !(out_done && err_done) {
+        let mut progressed = false;
+        for (pipe, buf, done) in [
+            (&out, &mut *stdout, &mut out_done),
+            (&err, &mut *stderr, &mut err_done),
+        ] {
+            if *done {
+                continue;
+            }
+            match pipe.read(&mut chunk) {
+                Ok(0) => *done = true,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    progressed = true;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => progressed = true,
+                Err(e) => return Err(e),
+            }
+        }
+        if !progressed && !(out_done && err_done) {
+            // Nothing ready on either stream: yield instead of spinning.
+            crate::thread::yield_now();
+        }
+    }
+    Ok(())
 }
 
 pub fn getpid() -> u32 {
