@@ -174,8 +174,11 @@ pub struct File {
 pub struct FileAttr {
     size: u64,
     mode: u32,
+    nlink: u32,
+    ino: u64,
     mtime: (i64, i64),
     atime: (i64, i64),
+    ctime: (i64, i64),
 }
 pub struct ReadDir {
     dir: *mut crate::ffi::c_void,
@@ -196,8 +199,11 @@ impl FileAttr {
         FileAttr {
             size: a.size,
             mode: a.mode,
+            nlink: a.nlink,
+            ino: a.ino,
             mtime: (a.mtime_sec, a.mtime_nsec),
             atime: (a.atime_sec, a.atime_nsec),
+            ctime: (a.ctime_sec, a.ctime_nsec),
         }
     }
 }
@@ -230,6 +236,14 @@ pub struct DirBuilder {}
 
 impl FileAttr {
     pub fn size(&self) -> u64 { self.size }
+    pub fn mode(&self) -> u32 { self.mode }
+    pub fn nlink(&self) -> u32 { self.nlink }
+    /// AROS derives this from a hash of the path, so it is stable per file but
+    /// carries no meaning beyond identity.
+    pub fn ino(&self) -> u64 { self.ino }
+    pub fn mtime(&self) -> (i64, i64) { self.mtime }
+    pub fn atime(&self) -> (i64, i64) { self.atime }
+    pub fn ctime(&self) -> (i64, i64) { self.ctime }
     pub fn perm(&self) -> FilePermissions { FilePermissions { mode: self.mode } }
     pub fn file_type(&self) -> FileType { FileType { mode: self.mode } }
     pub fn modified(&self) -> io::Result<SystemTime> { SystemTime::new(self.mtime.0, self.mtime.1) }
