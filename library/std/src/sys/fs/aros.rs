@@ -567,6 +567,11 @@ pub fn exists(path: &Path) -> io::Result<bool> {
 pub fn readlink(p: &Path) -> io::Result<PathBuf> {
     let path = cstr(p)?;
     // readlink doesn't NUL-terminate and gives no size hint; grow until it fits.
+    // A symlink target is bounded by the filesystem (well under a few KB), so
+    // cap the growth: a handler that keeps reporting "buffer too small" past
+    // this is misbehaving (e.g. answering ACTION_READ_LINK on a non-symlink),
+    // and unbounded growth would exhaust memory rather than fail the call.
+    const MAX_CAP: usize = 64 * 1024;
     let mut cap = 256usize;
     loop {
         let mut buf: Vec<u8> = vec![0; cap];
@@ -582,7 +587,13 @@ pub fn readlink(p: &Path) -> io::Result<PathBuf> {
             let os = unsafe { OsString::from_encoded_bytes_unchecked(buf) };
             return Ok(PathBuf::from(os));
         }
-        cap *= 2; // filled the buffer: the target may be longer, retry bigger
+        if cap >= MAX_CAP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "readlink target exceeds the maximum symlink length",
+            ));
+        }
+        cap = (cap * 2).min(MAX_CAP); // filled the buffer: the target may be longer, retry bigger
     }
 }
 
