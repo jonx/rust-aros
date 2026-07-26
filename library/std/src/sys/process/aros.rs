@@ -1,29 +1,32 @@
-//! Processes for AROS, over dos `SystemTagList` (via the `aros_system` glue).
+//! Processes for AROS, over dos `SystemTagList` (via the `aros_proc_*` glue).
 //!
-//! AROS has no fork/exec: the shell runs a command *line*. So `Command` is turned
-//! into a properly-quoted line and handed to `SystemTagList`, which runs it
-//! synchronously and returns the command's exit code.
+//! AROS has no fork/exec: a shell runs a command *line*. So `Command` becomes a
+//! properly-quoted line handed to `SystemTagList`, which starts a shell to run
+//! it. The child is asynchronous and its streams are live `PIPE:` endpoints, so
+//! `spawn()` gives a real running child with a readable `stdout` and a writable
+//! `stdin`, and its exit is signalled rather than polled (`sys/pipe/aros.rs`,
+//! `aros_proc_glue.c`).
 //!
-//! Scope (honest caveats): `output()` captures stdout/stderr by redirecting the
-//! child to `MacRW:` temp files and reading them back (uses the `fs` pal); `spawn()`
-//! runs synchronously with inherited stdio, so `status()` works but there are no live
-//! pipes and no true background child (a `spawn()`d process has already finished when
-//! the handle returns).
+//! Two shapes of child, and the difference matters:
 //!
-//! **`cwd` and per-command `env` ARE honoured** (via a tiny injected shell script):
-//! AROS has no fork/exec and a `System` child inherits neither the caller's current
-//! directory *variables* nor its local environment variables, so when a `Command`
-//! carries a cwd or env override we emit a one-off script that `CD`s and `Set`s in the
-//! child shell, then runs the command, and invoke it with `Execute`. Non-resident
-//! commands run inside that shell's process and share its local vars, so the env
-//! reaches the real child.
+//! - **A command.** The shell runs the line and exits. This is what
+//!   `Command::new("C:List")` means.
+//! - **No command at all** (an empty program name). AROS starts a new CLI that
+//!   goes on reading its input, which is the only way to get an interactive
+//!   shell on a given pair of streams -- what a terminal needs. `System`'s
+//!   default is the first kind, so the glue asks for the second explicitly.
 //!
-//! Still unsupported (documented tier-3 gaps): live bidirectional pipes and an async
-//! background child with a readable `Child.stdout`/writable `Child.stdin` -- these need
-//! a pipe handler the hosted boot does not mount (no `PIPE:`) and a real spawn model
-//! AROS's line-oriented `SystemTagList` does not provide. `env_clear()` cannot be fully
-//! honoured (the local-var set can't be enumerated to blank it), and `kill` is a no-op
-//! (the command has already finished on the synchronous path).
+//! **`cwd` and per-command `env` ARE honoured.** A `System` child inherits
+//! neither the caller's current directory nor its local variables, so a
+//! `Command` carrying either gets a generated `CD`/`Set` preamble. For a
+//! command that is a one-off script run with `Execute`; for an interactive
+//! shell it is written into the child's stdin instead, since `Execute` hands
+//! the shell a file and the shell is finished when the file is.
+//!
+//! Remaining gaps: an interactive shell with no pipe on its stdin has nowhere
+//! to receive its cwd/env, so they are not applied; `env_clear()` cannot be
+//! fully honoured (the local-var set cannot be enumerated to blank it); and
+//! `kill` is a no-op, AROS having no way to stop another process.
 
 use super::env::{CommandEnv, CommandEnvs, CommandResolvedEnvs};
 pub use crate::ffi::OsString as EnvKey;
@@ -45,6 +48,7 @@ unsafe extern "C" {
         in_mode: i32,
         out_mode: i32,
         err_mode: i32,
+        interactive: i32,
         p_in: *mut isize,
         p_out: *mut isize,
         p_err: *mut isize,
@@ -215,6 +219,33 @@ impl Command {
         line
     }
 
+    /// The `CD` / `Set` / `Unset` lines that apply `cwd` and `env` in the child
+    /// shell, one per line, each already newline-terminated.
+    fn setup_lines(&self) -> String {
+        let mut setup = String::new();
+        if let Some(dir) = &self.cwd {
+            setup.push_str("CD ");
+            quote_into(dir, &mut setup);
+            setup.push('\n');
+        }
+        for (k, v) in self.env.iter() {
+            match v {
+                Some(val) => {
+                    setup.push_str("Set ");
+                    quote_into(k, &mut setup);
+                    setup.push(' ');
+                    quote_into(val, &mut setup);
+                }
+                None => {
+                    setup.push_str("Unset ");
+                    quote_into(k, &mut setup);
+                }
+            }
+            setup.push('\n');
+        }
+        setup
+    }
+
     /// Resolve the command into the actual line to hand `SystemTagList`, applying
     /// `cwd` and per-command `env`. With neither set, that's just the quoted command
     /// line. With either set, AROS's no-fork `System` can't apply them (a child
@@ -226,27 +257,19 @@ impl Command {
         if self.cwd.is_none() && !has_env {
             return Ok((self.command_line(), None));
         }
-        let mut script = String::new();
-        if let Some(dir) = &self.cwd {
-            script.push_str("CD ");
-            quote_into(dir, &mut script);
-            script.push('\n');
+
+        // A shell with no command is an interactive one, and it has to be left
+        // reading its input. Neither way of carrying the setup on the command
+        // line survives that: `Execute` hands the shell a file and the shell is
+        // finished when the file is, and injecting the setup as the command
+        // line makes it a shell that runs a command and exits. Either way the
+        // session ends immediately. `spawn` writes the setup into the child's
+        // stdin instead, where it is just the first thing typed.
+        if self.command_line().is_empty() {
+            return Ok((String::new(), None));
         }
-        for (k, v) in self.env.iter() {
-            match v {
-                Some(val) => {
-                    script.push_str("Set ");
-                    quote_into(k, &mut script);
-                    script.push(' ');
-                    quote_into(val, &mut script);
-                }
-                None => {
-                    script.push_str("Unset ");
-                    quote_into(k, &mut script);
-                }
-            }
-            script.push('\n');
-        }
+
+        let mut script = self.setup_lines();
         script.push_str(&self.command_line());
         script.push('\n');
 
@@ -273,6 +296,10 @@ impl Command {
         let out_mode = disposition(Some(self.stdout.as_ref().unwrap_or(&default)));
         let err_mode = disposition(Some(self.stderr.as_ref().unwrap_or(&default)));
 
+        // A shell with no command line is a terminal's shell: it has to keep
+        // reading its input rather than run one command and exit.
+        let interactive = line.is_empty();
+
         let (mut h_in, mut h_out, mut h_err) = (0isize, 0isize, 0isize);
         let handle = unsafe {
             aros_proc_spawn(
@@ -280,6 +307,7 @@ impl Command {
                 in_mode,
                 out_mode,
                 err_mode,
+                interactive as i32,
                 &mut h_in,
                 &mut h_out,
                 &mut h_err,
@@ -301,6 +329,19 @@ impl Command {
             stdout: (h_out != 0).then(|| ChildPipe::from_handle(h_out)),
             stderr: (h_err != 0).then(|| ChildPipe::from_handle(h_err)),
         };
+
+        // See `resolve_line`: an interactive shell takes its cwd and env as the
+        // first thing it reads. Without a pipe to its stdin there is nowhere to
+        // put them, and they are silently not applied -- the same as asking for
+        // an interactive shell with nothing to type at it.
+        if line.is_empty() {
+            if let Some(stdin) = &pipes.stdin {
+                let setup = self.setup_lines();
+                if !setup.is_empty() {
+                    stdin.write(setup.as_bytes())?;
+                }
+            }
+        }
         Ok((Process { handle, status: None, script }, pipes))
     }
 }
