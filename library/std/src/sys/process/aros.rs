@@ -16,17 +16,18 @@
 //!   shell on a given pair of streams -- what a terminal needs. `System`'s
 //!   default is the first kind, so the glue asks for the second explicitly.
 //!
-//! **`cwd` and per-command `env` ARE honoured.** A `System` child inherits
-//! neither the caller's current directory nor its local variables, so a
-//! `Command` carrying either gets a generated `CD`/`Set` preamble. For a
-//! command that is a one-off script run with `Execute`; for an interactive
-//! shell it is written into the child's stdin instead, since `Execute` hands
-//! the shell a file and the shell is finished when the file is.
+//! **`cwd` and per-command `env` ARE honoured**, by different routes. `cwd` is
+//! handed to the child as its own directory, so nothing is typed at it. `env`
+//! has no such route -- a `System` child does not inherit the caller's local
+//! variables -- so it becomes a generated `Set` preamble: a one-off script run
+//! with `Execute` for a command, or written into the child's stdin for an
+//! interactive shell, `Execute` handing the shell a file and the shell being
+//! finished when the file is.
 //!
 //! Remaining gaps: an interactive shell with no pipe on its stdin has nowhere
-//! to receive its cwd/env, so they are not applied; `env_clear()` cannot be
-//! fully honoured (the local-var set cannot be enumerated to blank it); and
-//! `kill` is a no-op, AROS having no way to stop another process.
+//! to receive its `env`, so it is not applied; `env_clear()` cannot be fully
+//! honoured (the local-var set cannot be enumerated to blank it); and `kill` is
+//! a no-op, AROS having no way to stop another process.
 
 use super::env::{CommandEnv, CommandEnvs, CommandResolvedEnvs};
 pub use crate::ffi::OsString as EnvKey;
@@ -49,6 +50,7 @@ unsafe extern "C" {
         out_mode: i32,
         err_mode: i32,
         interactive: i32,
+        cwd: *const c_char,
         p_in: *mut isize,
         p_out: *mut isize,
         p_err: *mut isize,
@@ -85,6 +87,10 @@ fn spawn_error() -> io::Error {
             format!("cannot open the {end} end of the child's {stream} pipe (dos error {ioerr})"),
         ),
         5 => io::Error::new(io::ErrorKind::NotFound, "cannot open NIL:"),
+        8 => io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("cannot reach the working directory (dos error {ioerr})"),
+        ),
         6 => io::Error::new(
             io::ErrorKind::Other,
             format!("the shell could not be started (dos error {ioerr})"),
@@ -219,15 +225,14 @@ impl Command {
         line
     }
 
-    /// The `CD` / `Set` / `Unset` lines that apply `cwd` and `env` in the child
-    /// shell, one per line, each already newline-terminated.
+    /// The `Set` / `Unset` lines that apply `env` in the child shell, one per
+    /// line, each already newline-terminated.
+    ///
+    /// `cwd` is not here: it is handed to the child as its own directory, which
+    /// a shell command could not be without also being read, run and prompted
+    /// for like anything else typed at an interactive shell.
     fn setup_lines(&self) -> String {
         let mut setup = String::new();
-        if let Some(dir) = &self.cwd {
-            setup.push_str("CD ");
-            quote_into(dir, &mut setup);
-            setup.push('\n');
-        }
         for (k, v) in self.env.iter() {
             match v {
                 Some(val) => {
@@ -254,7 +259,7 @@ impl Command {
     /// command, and return `Execute <script>` plus the temp script path to delete.
     fn resolve_line(&self) -> io::Result<(String, Option<PathBuf>)> {
         let has_env = self.env.iter().next().is_some();
-        if self.cwd.is_none() && !has_env {
+        if !has_env {
             return Ok((self.command_line(), None));
         }
 
@@ -269,7 +274,15 @@ impl Command {
             return Ok((String::new(), None));
         }
 
-        let mut script = self.setup_lines();
+        let mut script = String::new();
+        if let Some(dir) = &self.cwd {
+            // The script runs in a sub-shell of the child, so it has to CD
+            // there itself even though the child already starts there.
+            script.push_str("CD ");
+            quote_into(dir, &mut script);
+            script.push('\n');
+        }
+        script.push_str(&self.setup_lines());
         script.push_str(&self.command_line());
         script.push('\n');
 
@@ -300,6 +313,12 @@ impl Command {
         // reading its input rather than run one command and exit.
         let interactive = line.is_empty();
 
+        let cwd_c = match &self.cwd {
+            Some(dir) => Some(cstr(&dir.to_string_lossy())?),
+            None => None,
+        };
+        let cwd_ptr = cwd_c.as_ref().map_or(crate::ptr::null(), |c| c.as_ptr());
+
         let (mut h_in, mut h_out, mut h_err) = (0isize, 0isize, 0isize);
         let handle = unsafe {
             aros_proc_spawn(
@@ -308,6 +327,7 @@ impl Command {
                 out_mode,
                 err_mode,
                 interactive as i32,
+                cwd_ptr,
                 &mut h_in,
                 &mut h_out,
                 &mut h_err,
@@ -330,10 +350,10 @@ impl Command {
             stderr: (h_err != 0).then(|| ChildPipe::from_handle(h_err)),
         };
 
-        // See `resolve_line`: an interactive shell takes its cwd and env as the
-        // first thing it reads. Without a pipe to its stdin there is nowhere to
-        // put them, and they are silently not applied -- the same as asking for
-        // an interactive shell with nothing to type at it.
+        // See `resolve_line`: an interactive shell takes its env as the first
+        // thing it reads. Without a pipe to its stdin there is nowhere to put
+        // it, and it is silently not applied -- the same as asking for an
+        // interactive shell with nothing to type at it.
         if line.is_empty() {
             if let Some(stdin) = &pipes.stdin {
                 let setup = self.setup_lines();
