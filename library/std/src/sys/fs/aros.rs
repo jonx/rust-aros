@@ -30,7 +30,10 @@ mod c {
     pub type mode_t = u16;
     pub type off_t = i64;
     unsafe extern "C" {
-        pub fn open(path: *const c_char, flags: c_int, ...) -> c_int;
+        // aros_fs_glue.c, not posixc open() directly: AROS reports failures
+        // through IoErr(), which does not reliably reach errno, so a failed
+        // open came back with no reason attached at all.
+        pub fn aros_open(path: *const c_char, flags: c_int, mode: c_int) -> c_int;
         pub fn read(fd: c_int, buf: *mut u8, count: usize) -> isize;
         pub fn write(fd: c_int, buf: *const u8, count: usize) -> isize;
         pub fn lseek(fd: c_int, offset: off_t, whence: c_int) -> off_t;
@@ -381,9 +384,7 @@ impl OpenOptions {
 impl File {
     pub fn open(path: &Path, opts: &OpenOptions) -> io::Result<File> {
         let p = cstr(path)?;
-        // AROS `open` is variadic and reads the `mode` va_arg unconditionally, so
-        // always pass it (ignored unless O_CREAT).
-        let fd = unsafe { c::open(p.as_ptr(), opts.flags()?, 0o666 as crate::ffi::c_int) };
+        let fd = unsafe { c::aros_open(p.as_ptr(), opts.flags()?, 0o666 as crate::ffi::c_int) };
         if fd < 0 { Err(io::Error::last_os_error()) } else { Ok(File { fd }) }
     }
 
