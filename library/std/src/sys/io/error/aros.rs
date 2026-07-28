@@ -8,11 +8,21 @@ use crate::io::ErrorKind;
 
 unsafe extern "C" {
     fn __stdc_geterrnoptr() -> *mut i32;
+    /// The task's shared StdCBase errno cell (aros_fs_glue.c).
+    fn aros_libbase_errno() -> i32;
     fn strerror(errnum: i32) -> *const u8;
 }
 
 pub fn errno() -> i32 {
-    unsafe { *__stdc_geterrnoptr() }
+    // Two cells, an accident of linkage. __stdc_geterrnoptr() is a
+    // link-library function: the app's copy carries pthread's per-thread hook,
+    // so it names a per-thread cell here -- but stdc.library and
+    // posixc.library each have their own copy with no hook, and write the
+    // task's shared base cell instead. An EEXIST set by posixc's open on a
+    // pthread lands only there. Per-thread first (in-app writers, and the
+    // main task where both are the same cell), then the base cell.
+    let e = unsafe { *__stdc_geterrnoptr() };
+    if e != 0 { e } else { unsafe { aros_libbase_errno() } }
 }
 
 #[allow(dead_code)]
