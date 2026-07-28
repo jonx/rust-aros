@@ -38,16 +38,20 @@ mod c {
         pub fn write(fd: c_int, buf: *const u8, count: usize) -> isize;
         pub fn lseek(fd: c_int, offset: off_t, whence: c_int) -> off_t;
         pub fn close(fd: c_int) -> c_int;
-        pub fn unlink(path: *const c_char) -> c_int;
+        // The path-taking calls go through the glue (clear both errno cells,
+        // recover a reason from the base cell or IoErr): a direct posixc call
+        // that fails on a pthread otherwise reads back a stale shared-cell
+        // value, which broke create_dir_all on an existing directory.
+        pub fn aros_unlink(path: *const c_char) -> c_int;
         pub fn dup(fd: c_int) -> c_int;
         pub fn ftruncate(fd: c_int, length: off_t) -> c_int;
         // aros_fs_glue.c: Lock() + NameFromLock(). posixc realpath() is
         // unusable here -- it open(".")s to save the cwd, and "." is an
         // invalid component name to DOS, so it fails EINVAL on every input.
         pub fn aros_realpath(path: *const c_char, buf: *mut c_char, buflen: usize) -> c_int;
-        pub fn rename(old: *const c_char, new: *const c_char) -> c_int;
-        pub fn mkdir(path: *const c_char, mode: mode_t) -> c_int;
-        pub fn rmdir(path: *const c_char) -> c_int;
+        pub fn aros_rename(old: *const c_char, new: *const c_char) -> c_int;
+        pub fn aros_mkdir(path: *const c_char, mode: c_int) -> c_int;
+        pub fn aros_rmdir(path: *const c_char) -> c_int;
         // directory listing (aros_fs_glue.c, over posixc opendir/readdir/closedir)
         pub fn aros_opendir(path: *const c_char) -> *mut c_void;
         pub fn aros_readdir(dir: *mut c_void, namebuf: *mut c_char, buflen: usize, type_out: *mut u32) -> c_int;
@@ -494,7 +498,7 @@ impl DirBuilder {
     pub fn new() -> DirBuilder { DirBuilder {} }
     pub fn mkdir(&self, p: &Path) -> io::Result<()> {
         let c = cstr(p)?;
-        if unsafe { c::mkdir(c.as_ptr(), 0o777) } == 0 {
+        if unsafe { c::aros_mkdir(c.as_ptr(), 0o777) } == 0 {
             return Ok(());
         }
         let err = io::Error::last_os_error();
@@ -531,13 +535,13 @@ pub fn readdir(p: &Path) -> io::Result<ReadDir> {
 
 pub fn unlink(p: &Path) -> io::Result<()> {
     let c = cstr(p)?;
-    if unsafe { c::unlink(c.as_ptr()) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    if unsafe { c::aros_unlink(c.as_ptr()) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
 pub fn rename(old: &Path, new: &Path) -> io::Result<()> {
     let a = cstr(old)?;
     let b = cstr(new)?;
-    if unsafe { c::rename(a.as_ptr(), b.as_ptr()) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    if unsafe { c::aros_rename(a.as_ptr(), b.as_ptr()) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
 pub fn set_perm(p: &Path, perm: FilePermissions) -> io::Result<()> {
@@ -588,7 +592,7 @@ pub fn set_times_nofollow(_p: &Path, _times: FileTimes) -> io::Result<()> {
 
 pub fn rmdir(p: &Path) -> io::Result<()> {
     let c = cstr(p)?;
-    if unsafe { c::rmdir(c.as_ptr()) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    if unsafe { c::aros_rmdir(c.as_ptr()) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
 // Portable recursive implementation over this backend's read_dir/remove.
