@@ -112,13 +112,19 @@ re-vendoring:
 ## Relationship to the rest of the port
 
 This is one of five checkouts. The full map, the from-scratch build guide,
-and the troubleshooting ledger are in **Feraille**'s
+and the troubleshooting ledger are in **Ferail**'s
 `docs/features/aros-building.md` (branch `aros-port`). In short:
 
-- **Feraille** (the app being ported) → **gpui** (a zed fork, `zed-aros`,
+- **Ferail** (the app being ported) → **gpui** (a zed fork, `zed-aros`,
   with the `gpui_aros` CPU backend) → this **std** → **AROS**.
 - The C glue the pal calls, the target JSON, and the run harness all live in
   **`aros-aarch64`**.
+
+> **Name note (2026-07-30):** the app being ported was renamed *Feraille* →
+> *Ferail*, and its repo `jonx/Feraille` → `jonx/Ferail` (the old URL still
+> redirects). Older references here and elsewhere that say *Feraille* mean the
+> same app. Do not confuse it with `jonx/Ferail-win32`, the unrelated older
+> Windows predecessor that previously held the `jonx/Ferail` name.
 
 ## License
 
