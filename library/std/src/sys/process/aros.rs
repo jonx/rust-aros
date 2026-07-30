@@ -26,8 +26,9 @@
 //!
 //! Remaining gaps: an interactive shell with no pipe on its stdin has nowhere
 //! to receive its `env`, so it is not applied; `env_clear()` cannot be fully
-//! honoured (the local-var set cannot be enumerated to blank it); and `kill` is
-//! a no-op, AROS having no way to stop another process.
+//! honoured (the local-var set cannot be enumerated to blank it); and `kill`
+//! sends the Amiga break signal (the strongest stop the platform has), which a
+//! program that never polls for break will ignore.
 
 use super::env::{CommandEnv, CommandEnvs, CommandResolvedEnvs};
 pub use crate::ffi::OsString as EnvKey;
@@ -61,6 +62,8 @@ unsafe extern "C" {
     fn aros_task_self() -> *mut crate::ffi::c_void;
     fn aros_proc_exited(handle: *mut crate::ffi::c_void, code: *mut i32) -> i32;
     fn aros_proc_free(handle: *mut crate::ffi::c_void);
+    /// SIGBREAKF_CTRL_C to the child, found by its CLI number. 1 if sent.
+    fn aros_proc_interrupt(handle: *mut crate::ffi::c_void) -> i32;
     /// Why the last spawn failed, plus the dos error that came with it.
     fn aros_proc_last_fail(ioerr: *mut c_long, step: *mut c_long) -> c_long;
 
@@ -548,11 +551,17 @@ impl Process {
     }
 
     pub fn kill(&mut self) -> io::Result<()> {
-        // Signalling an arbitrary AROS process to die is not generally safe:
-        // there is no equivalent of SIGKILL that unwinds a Process's resources.
-        // Closing the child's stdin (drop its ChildStdin) is the supported way
-        // to ask a well-behaved child to stop.
-        Err(io::const_error!(io::ErrorKind::Unsupported, "killing a child is not supported on AROS"))
+        // The strongest stop the platform has: the Amiga break convention,
+        // SIGBREAKF_CTRL_C to the child's process. It is a request -- there is
+        // no SIGKILL, and a program that never polls for break keeps running --
+        // but the shell and every well-behaved command honour it, and it is
+        // what the terminal's interrupt key is. Sent by CLI number under
+        // Forbid, so an exited child is never signalled.
+        if self.status.is_some() {
+            return Ok(());
+        }
+        unsafe { aros_proc_interrupt(self.handle) };
+        Ok(())
     }
 
     fn reap(&mut self, code: i32) -> ExitStatus {
