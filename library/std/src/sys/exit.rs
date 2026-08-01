@@ -135,6 +135,18 @@ pub fn exit(code: i32) -> ! {
         target_os = "xous" => {
             crate::os::xous::ffi::exit(code as u32)
         }
+        target_os = "aros" => {
+            // AROS is not `target_family = "unix"`, so without this arm it
+            // falls through to the generic `abort()` below — meaning every
+            // `process::exit` on this target became an exec DEADEND alert
+            // instead of a normal exit. posixc provides C `exit`, which is
+            // what the unix arm reaches for; use it directly rather than
+            // through the `libc` crate, which has no AROS bindings.
+            unsafe extern "C" {
+                fn exit(code: crate::ffi::c_int) -> !;
+            }
+            unsafe { exit(code as crate::ffi::c_int) }
+        }
         _ => {
             let _ = code;
             crate::intrinsics::abort()
