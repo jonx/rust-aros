@@ -31,7 +31,7 @@ git repo you edit**:
 | # | Piece | Where | Role |
 |---|-------|-------|------|
 | 1 | **This repo** (`rust-aros`) | `~/Source/rust-aros` | The std pal — the OS-specific half of the standard library. |
-| 2 | **Target spec JSON** | `aros-aarch64/hosted/rust/aarch64-unknown-aros.json` | Defines the `aarch64-unknown-aros` target (aarch64 ELF, `mcmodel=large`, x18 reserved, static, `panic=abort`). |
+| 2 | **Target spec JSON** | `aros-aarch64/hosted/rust/aarch64-unknown-aros.json` | Defines the `aarch64-unknown-aros` target (aarch64 ELF, `mcmodel=large`, x18 reserved as hosted Macaros requires; native AROS does not need the reservation, static, `panic=abort`). |
 | 3 | **Stock nightly rustc** | `rustup … nightly-2026-06-27` | Unmodified. Does all codegen. |
 
 The target is built as a **custom-JSON `-Zbuild-std` target**: rustc compiles
